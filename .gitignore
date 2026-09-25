@@ -1,23 +1,41 @@
+# Data and large files
 student_resource/dataset/
 student_resource/.DS_Store
+6ab10eb3b23ba_student_resource/
+dataset/
 output/
+*.tsv
+*.csv
+*.zip
 *.npy
 *.npz
 *.lgb
 *.txt
 !requirements.txt
-*.pkl
 *.joblib
 *.faiss
 *.bin
+*.pkl
+
+# Virtual environment & caches
 .venv/
 venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
 .ipynb_checkpoints/
+*.egg-info/
+.DS_Store
+
+# Logs & experiments
+logs/
+experiments/
+artifacts/
 sagemaker-out/
 .sagemaker/
-*.egg-info/
-.pytest_cache/
-.DS_Store
 graphify-out/
+
+# Antigravity agents
+.agents/

@@ -1,0 +1,17 @@
+# Core Tabular & Mathematical Stack
+numpy>=1.25.0
+pandas>=2.1.0
+scipy>=1.11.0
+scikit-learn>=1.3.0
+rapidfuzz>=3.5.0
+indic-transliteration>=2.3.80
+
+# Gradient Boosting
+lightgbm>=4.1.0
+catboost>=1.2.0
+
+# Deep Learning & Vector Search (Cloud GPU)
+torch>=2.1.0
+transformers>=4.35.0
+sentence-transformers>=2.3.0
+faiss-cpu>=1.7.4
