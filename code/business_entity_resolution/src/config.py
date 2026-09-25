@@ -60,9 +60,19 @@ def detect_validate_script() -> Path:
     if local_script.exists():
         return local_script
 
-    for cand in [Path("./utils/validate_submission.py"), Path("../utils/validate_submission.py")]:
+    for cand in [
+        Path("./utils/validate_submission.py"),
+        Path("../utils/validate_submission.py"),
+        Path("../../student_resource/utils/validate_submission.py"),
+        Path("../../../student_resource/utils/validate_submission.py"),
+        Path("/kaggle/working/tea-ml/student_resource/utils/validate_submission.py")
+    ]:
         if cand.exists():
             return cand.resolve()
+
+    if Path("/kaggle/working").exists():
+        for p in Path("/kaggle/working").rglob("validate_submission.py"):
+            return p
 
     return Path("validate_submission.py")
 
