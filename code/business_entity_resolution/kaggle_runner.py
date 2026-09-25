@@ -33,9 +33,10 @@ def main():
         import rapidfuzz
         import indic_transliteration
         import lightgbm
+        import tqdm
     except ImportError:
-        print("\n[Step 1/5] Installing core dependencies (rapidfuzz, indic-transliteration)...")
-        run_cmd(f"{sys.executable} -m pip install -q rapidfuzz indic-transliteration lightgbm")
+        print("\n[Step 1/5] Installing core dependencies (rapidfuzz, indic-transliteration, tqdm)...")
+        run_cmd(f"{sys.executable} -m pip install -q rapidfuzz indic-transliteration lightgbm tqdm")
 
     # 2. Setup paths
     src_dir = Path(__file__).parent / "src"
@@ -66,6 +67,15 @@ def main():
     parser.add_argument("--use-dense", action="store_true", help="Enable dense multilingual embedding blocking")
     parser.add_argument("--skip-test", action="store_true", help="Skip test set inference (useful for fast cross-validation diagnostics)")
     args = parser.parse_args()
+
+    # If dense blocking is requested, ensure faiss and sentence-transformers are present
+    if args.use_dense:
+        try:
+            import faiss
+            import sentence_transformers
+        except ImportError:
+            print("\n[Step 1b/5] Installing dense vector dependencies (faiss-cpu, sentence-transformers)...")
+            run_cmd(f"{sys.executable} -m pip install -q faiss-cpu sentence-transformers")
 
     # Check for GPU
     try:

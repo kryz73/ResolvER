@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 from sklearn.model_selection import GroupKFold
+from tqdm import tqdm
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -121,7 +122,10 @@ def train_5fold_cv(
     models = []
 
     print(f"  [Training] Starting {n_splits}-fold GroupKFold cross validation over {len(labels):,} candidate pairs...")
-    for fold, (train_idx, val_idx) in enumerate(gkf.split(X, labels, groups=groups), start=1):
+    fold_iter = enumerate(gkf.split(X, labels, groups=groups), start=1)
+    fold_iter = tqdm(fold_iter, total=n_splits, desc="  [Training] 5-Fold GroupKFold CV")
+
+    for fold, (train_idx, val_idx) in fold_iter:
         X_tr, y_tr = X[train_idx], labels[train_idx]
         X_va, y_va = X[val_idx], labels[val_idx]
 

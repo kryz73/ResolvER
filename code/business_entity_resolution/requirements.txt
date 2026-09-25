@@ -5,6 +5,7 @@ scipy>=1.11.0
 scikit-learn>=1.3.0
 rapidfuzz>=3.5.0
 indic-transliteration>=2.3.80
+tqdm>=4.66.0
 
 # Gradient Boosting
 lightgbm>=4.1.0

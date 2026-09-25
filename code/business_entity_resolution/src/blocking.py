@@ -10,6 +10,7 @@ from typing import Dict, List, Set, Tuple, Optional
 import pandas as pd
 import numpy as np
 from rapidfuzz import fuzz
+from tqdm import tqdm
 
 from config import MAX_CANDIDATES_PER_ENTITY
 
@@ -69,7 +70,11 @@ class LexicalBlocker:
         norm_addrs = target_df['norm_address'].tolist()
         postals = target_df['postal_code'].tolist()
 
-        for eid, norm_name, norm_addr, postal in zip(eids, norm_names, norm_addrs, postals):
+        iterator = zip(eids, norm_names, norm_addrs, postals)
+        if len(eids) >= 1000:
+            iterator = tqdm(iterator, total=len(eids), desc=f"  [Blocking] Indexing Targets ({len(eids):,})", mininterval=0.5)
+
+        for eid, norm_name, norm_addr, postal in iterator:
             self.target_records[eid] = norm_name
 
             # 1. Significant brand tokens (including guarded 2-letter brands)
@@ -255,7 +260,11 @@ def run_hybrid_blocking(
     norm_addrs = s1_df['norm_address'].tolist()
     postals = s1_df['postal_code'].tolist()
 
-    for s1_id, norm_name, norm_addr, postal in zip(s1_ids, norm_names, norm_addrs, postals):
+    iterator = zip(s1_ids, norm_names, norm_addrs, postals)
+    if len(s1_ids) >= 100:
+        iterator = tqdm(iterator, total=len(s1_ids), desc=f"  [Blocking] Querying S1 ({len(s1_ids):,})", mininterval=0.5)
+
+    for s1_id, norm_name, norm_addr, postal in iterator:
         hits = lex_blocker.retrieve_candidates(norm_name, norm_addr, postal)
         for tid, _ in hits:
             candidates_per_s1[s1_id].add(tid)
@@ -303,9 +312,13 @@ def write_candidate_pairs_tsv(
     Format: source1_entity_id \t candidate_entity_ids (comma-separated)
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    iterator = required_s1_ids
+    if len(required_s1_ids) >= 10000:
+        iterator = tqdm(required_s1_ids, desc="  [Output] Writing candidate_pairs.tsv", mininterval=1.0)
+
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("source1_entity_id\tcandidate_entity_ids\n")
-        for s1_id in required_s1_ids:
+        for s1_id in iterator:
             c_ids = candidates_dict.get(s1_id, set())
             if c_ids:
                 f.write(f"{s1_id}\t{','.join(sorted(c_ids))}\n")

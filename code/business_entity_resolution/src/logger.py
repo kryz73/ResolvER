@@ -92,7 +92,8 @@ class ExperimentTracker:
         pair_completeness: float,
         total_candidates: int,
         candidates_per_entity: float,
-        reduction_ratio: float
+        reduction_ratio: float,
+        by_country: Optional[Dict[str, Any]] = None
     ):
         self.metadata["blocking_metrics"] = {
             "total_ground_truth_matches": total_true_matches,
@@ -100,9 +101,10 @@ class ExperimentTracker:
             "pair_completeness_pct": round(pair_completeness, 3),
             "total_candidate_pairs": total_candidates,
             "avg_candidates_per_entity": round(candidates_per_entity, 2),
-            "reduction_ratio_pct": round(reduction_ratio, 6)
+            "reduction_ratio_pct": round(reduction_ratio, 6),
+            "by_country": by_country or {}
         }
-        self.log(f"Blocking Metrics: PC={pair_completeness:.2f}%, RR={reduction_ratio:.4f}%, Avg Candidates={candidates_per_entity:.1f}")
+        self.log(f"Overall Blocking Metrics: PC={pair_completeness:.2f}%, RR={reduction_ratio:.4f}%, Avg Candidates={candidates_per_entity:.1f}")
 
     def save_feature_importance(self, feature_names: List[str], importances: np.ndarray, top_n: int = 30):
         """Saves feature importance to CSV and logs top features."""

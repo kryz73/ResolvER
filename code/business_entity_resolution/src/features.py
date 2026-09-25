@@ -135,6 +135,9 @@ def extract_pairwise_features(
     return feats
 
 
+from tqdm import tqdm
+
+
 def build_feature_matrix(
     candidate_pairs: List[Tuple[str, str]],
     s1_df: pd.DataFrame,
@@ -155,7 +158,11 @@ def build_feature_matrix(
     feature_rows = []
     feature_names = None
 
-    for s1_id, t_id in candidate_pairs:
+    pair_iterator = candidate_pairs
+    if len(candidate_pairs) >= 1000:
+        pair_iterator = tqdm(candidate_pairs, desc=f"  [Features] Extracting {len(candidate_pairs):,} Pairs", mininterval=0.5)
+
+    for s1_id, t_id in pair_iterator:
         if s1_id not in s1_lookup or t_id not in target_lookup:
             continue
         s1_row = s1_lookup[s1_id]

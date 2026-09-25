@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from config import (
     TRAIN_S1_PATH, TRAIN_S2_PATH, TRAIN_S3_PATH, TRAIN_GT_PATH,
@@ -101,7 +102,7 @@ def run_pipeline(
     if train_sample_size and train_sample_size < len(s1_full):
         tracker.log("Streaming target records (all true positive targets + distractor background)...")
         s2_chunks = []
-        for chunk in pd.read_csv(TRAIN_S2_PATH, sep="\t", chunksize=250000):
+        for chunk in tqdm(pd.read_csv(TRAIN_S2_PATH, sep="\t", chunksize=250000), desc="  [Data] Streaming Source 2 Chunks"):
             hits = chunk[chunk['entity_id'].isin(target_ids_in_sample)]
             distractors = chunk[~chunk['entity_id'].isin(target_ids_in_sample)].sample(frac=0.015, random_state=42)
             s2_chunks.append(pd.concat([hits, distractors]))
@@ -110,7 +111,7 @@ def run_pipeline(
         s2_sample = pd.concat(s2_chunks, ignore_index=True)
 
         s3_chunks = []
-        for chunk in pd.read_csv(TRAIN_S3_PATH, sep="\t", chunksize=250000):
+        for chunk in tqdm(pd.read_csv(TRAIN_S3_PATH, sep="\t", chunksize=250000), desc="  [Data] Streaming Source 3 Chunks"):
             hits = chunk[chunk['entity_id'].isin(target_ids_in_sample)]
             distractors = chunk[~chunk['entity_id'].isin(target_ids_in_sample)].sample(frac=0.015, random_state=42)
             s3_chunks.append(pd.concat([hits, distractors]))
@@ -166,13 +167,40 @@ def run_pipeline(
     reduction_ratio = (1.0 - (float(total_candidate_pairs) / total_cartesian)) * 100.0 if total_cartesian > 0 else 100.0
     candidates_per_entity = total_candidate_pairs / float(len(s1_train)) if len(s1_train) > 0 else 0.0
 
+    # Country-specific blocking breakdown (US vs India)
+    country_blocking_metrics = {}
+    for c_val in sorted(s1_train_proc['country'].unique()):
+        c_s1 = s1_train_proc[s1_train_proc['country'] == c_val]
+        c_s1_ids = set(c_s1['entity_id'])
+        c_true = sum(len(gt_train.get(sid, set())) for sid in c_s1_ids)
+        c_captured = sum(len(all_candidates.get(sid, set()) & gt_train.get(sid, set())) for sid in c_s1_ids)
+        c_candidates = sum(len(all_candidates.get(sid, set())) for sid in c_s1_ids)
+        c_recall = (c_captured / c_true * 100.0) if c_true > 0 else 0.0
+        c_avg_cand = c_candidates / len(c_s1_ids) if len(c_s1_ids) > 0 else 0.0
+
+        country_blocking_metrics[c_val] = {
+            "entities": len(c_s1_ids),
+            "true_matches": c_true,
+            "captured_matches": c_captured,
+            "pair_completeness_pct": round(c_recall, 3),
+            "avg_candidates_per_entity": round(c_avg_cand, 2)
+        }
+
+    tracker.log("\n" + "=" * 75)
+    tracker.log("BLOCKING RECALL BREAKDOWN BY COUNTRY (US vs INDIA):")
+    for c_name, c_data in country_blocking_metrics.items():
+        tracker.log(f"  * {c_name:6s}: Blocking Recall (PC) = {c_data['pair_completeness_pct']:6.2f}% | Captured {c_data['captured_matches']:,} / {c_data['true_matches']:,} matches | Avg Cands: {c_data['avg_candidates_per_entity']:.1f}")
+    tracker.log(f"  * OVERALL: Blocking Recall (PC) = {pair_completeness:6.2f}% | Captured {captured_matches:,} / {total_true_matches:,} matches | Avg Cands: {candidates_per_entity:.1f}")
+    tracker.log("=" * 75 + "\n")
+
     tracker.record_blocking_metrics(
         total_true_matches=total_true_matches,
         captured_matches=captured_matches,
         pair_completeness=pair_completeness,
         total_candidates=total_candidate_pairs,
         candidates_per_entity=candidates_per_entity,
-        reduction_ratio=reduction_ratio
+        reduction_ratio=reduction_ratio,
+        by_country=country_blocking_metrics
     )
     tracker.stop_timer("blocking")
 
@@ -220,6 +248,23 @@ def run_pipeline(
     )
     tracker.save_tuning_curve(tuning_records)
     tracker.log(f">>> OOF VALIDATION MACRO F0.5 = {val_macro_f05:.4f} <<<")
+
+    # Country-specific F0.5 evaluation (US vs India)
+    val_preds = apply_decision_rules(
+        pair_list, oof_probs, list(s1_train_ids),
+        match_threshold=best_tau,
+        singleton_threshold=best_tau_single,
+        max_matches=MAX_MATCHES_PER_ENTITY
+    )
+    tracker.log("\n" + "=" * 75)
+    tracker.log("VALIDATION MACRO F0.5 BREAKDOWN BY COUNTRY (US vs INDIA):")
+    for c_val in sorted(s1_train_proc['country'].unique()):
+        c_ids = s1_train_proc[s1_train_proc['country'] == c_val]['entity_id'].tolist()
+        c_f05 = evaluate_macro_f05(val_preds, gt_train, c_ids)
+        tracker.log(f"  * {c_val:6s}: Macro F0.5 = {c_f05:.4f} ({len(c_ids):,} entities)")
+    tracker.log(f"  * OVERALL: Macro F0.5 = {val_macro_f05:.4f} ({len(s1_train_ids):,} entities)")
+    tracker.log("=" * 75 + "\n")
+
     tracker.stop_timer("threshold_tuning")
 
     # Error Analysis Diagnostic Dump
@@ -347,7 +392,7 @@ def run_loco_evaluation(
 
     # Load targets (Sources 2 and 3)
     s2_chunks = []
-    for chunk in pd.read_csv(TRAIN_S2_PATH, sep="\t", chunksize=250000):
+    for chunk in tqdm(pd.read_csv(TRAIN_S2_PATH, sep="\t", chunksize=250000), desc="  [Data] Streaming Source 2 Chunks"):
         hits = chunk[chunk['entity_id'].isin(needed_targets)]
         distractors = chunk[~chunk['entity_id'].isin(needed_targets)].sample(frac=0.015, random_state=42)
         s2_chunks.append(pd.concat([hits, distractors]))
@@ -356,7 +401,7 @@ def run_loco_evaluation(
     s2_sample = pd.concat(s2_chunks, ignore_index=True)
 
     s3_chunks = []
-    for chunk in pd.read_csv(TRAIN_S3_PATH, sep="\t", chunksize=250000):
+    for chunk in tqdm(pd.read_csv(TRAIN_S3_PATH, sep="\t", chunksize=250000), desc="  [Data] Streaming Source 3 Chunks"):
         hits = chunk[chunk['entity_id'].isin(needed_targets)]
         distractors = chunk[~chunk['entity_id'].isin(needed_targets)].sample(frac=0.015, random_state=42)
         s3_chunks.append(pd.concat([hits, distractors]))

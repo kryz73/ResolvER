@@ -215,6 +215,9 @@ def standardize_address(address: str, country: str) -> str:
     return re.sub(r'\s+', ' ', cleaned).strip()
 
 
+from tqdm import tqdm
+
+
 def preprocess_dataframe(df: pd.DataFrame, is_reference: bool = False) -> pd.DataFrame:
     """
     Applies high-speed preprocessing pipeline to a source dataframe using fast zip iteration:
@@ -236,7 +239,12 @@ def preprocess_dataframe(df: pd.DataFrame, is_reference: bool = False) -> pd.Dat
     postals = []
     missing_flags = []
 
-    for raw_name, raw_addr, c in zip(names, addrs, countries):
+    desc = "S1 Reference" if is_reference else "Targets"
+    iterator = zip(names, addrs, countries)
+    if len(names) >= 500:
+        iterator = tqdm(iterator, total=len(names), desc=f"  [Preprocessing] {desc} ({len(names):,})", mininterval=0.5)
+
+    for raw_name, raw_addr, c in iterator:
         is_missing = (not raw_addr) or (raw_addr.strip() == '') or (raw_addr.strip().lower() == 'nan')
         missing_flags.append(is_missing)
 

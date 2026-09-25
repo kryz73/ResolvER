@@ -8,6 +8,7 @@ from collections import defaultdict
 from typing import Dict, List, Set, Tuple
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 
 def compute_f05_score(pred_set: Set[str], true_set: Set[str]) -> float:
@@ -124,7 +125,7 @@ def tune_decision_thresholds(
     singleton_range = np.arange(SINGLETON_SWEEP_MIN, SINGLETON_SWEEP_MAX + 1e-5, SINGLETON_SWEEP_STEP)
 
     print(f"  [Threshold Tuning] Grid searching tau in [{TAU_SWEEP_MIN:.2f}, {TAU_SWEEP_MAX:.2f}] & tau_single in [{SINGLETON_SWEEP_MIN:.2f}, {SINGLETON_SWEEP_MAX:.2f}]...")
-    for tau in tau_range:
+    for tau in tqdm(tau_range, desc="  [Threshold Tuning] Grid Search", mininterval=0.5):
         for tau_single in singleton_range:
             preds = {}
             for s1_id in all_s1_ids:
@@ -210,9 +211,13 @@ def write_matching_results_tsv(
     Format: source1_entity_id \t matched_entity_ids (comma-separated, empty for singletons)
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    iterator = required_s1_ids
+    if len(required_s1_ids) >= 10000:
+        iterator = tqdm(required_s1_ids, desc="  [Output] Writing matching_results.tsv", mininterval=1.0)
+
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("source1_entity_id\tmatched_entity_ids\n")
-        for s1_id in required_s1_ids:
+        for s1_id in iterator:
             m_ids = matches_dict.get(s1_id, set())
             if m_ids:
                 f.write(f"{s1_id}\t{','.join(sorted(m_ids))}\n")
