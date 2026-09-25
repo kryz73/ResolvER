@@ -31,7 +31,7 @@ import os
 from pathlib import Path
 
 if not Path('/kaggle/working/tea-ml').exists():
-    !git clone https://github.com/AdarshGuptaa/tea-ml.git /kaggle/working/tea-ml
+    !git clone -b DualBlock-AsymGBD https://github.com/AdarshGuptaa/tea-ml.git /kaggle/working/tea-ml
 
 # Navigate to the source directory
 %cd /kaggle/working/tea-ml/code/business_entity_resolution
