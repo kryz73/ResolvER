@@ -25,7 +25,8 @@ class AsymmetricEntityMatcher:
         learning_rate: float = 0.05,
         num_leaves: int = 31,
         n_estimators: int = 300,
-        random_state: int = 42
+        random_state: int = 42,
+        device: Optional[str] = None
     ):
         self.neg_weight = neg_weight
         self.learning_rate = learning_rate
@@ -33,7 +34,10 @@ class AsymmetricEntityMatcher:
         self.n_estimators = n_estimators
         self.random_state = random_state
 
-        self.device = "cuda" if os.environ.get("USE_GPU", "0") == "1" else "cpu"
+        if device:
+            self.device = device
+        else:
+            self.device = "cuda" if os.environ.get("USE_GPU", "0") == "1" else "cpu"
         self.scale_pos_weight = 1.0 / float(neg_weight)
         self.model = None
         self.feature_names = None

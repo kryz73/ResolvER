@@ -11,28 +11,57 @@ import pandas as pd
 import numpy as np
 from rapidfuzz import fuzz
 
+from config import MAX_CANDIDATES_PER_ENTITY
+
 try:
     import faiss
 except ImportError:
     faiss = None
 
+# Guarded 2-letter tokens exclusion set (common prepositions, units, indicators)
+STOP_2LETTER = {
+    'co', 'in', 'to', 'at', 'no', 'rd', 'st', 'dr', 'ln', 'av', 'of', 'on', 'by',
+    'is', 'it', 'as', 'or', 'an', 'am', 'pm', 'us', 'uk', 'll', 'al', 'de', 'la',
+    'le', 'du'
+}
+
+
+def extract_brand_tokens(name: str) -> List[str]:
+    """
+    Extracts significant brand tokens:
+    - Words with len >= 3
+    - 2-letter tokens (e.g. 3M, GE, HP, Om, AI, BP) excluding stop tokens in STOP_2LETTER.
+    """
+    raw_tokens = re.findall(r'\b[a-z0-9]{2,}\b', name)
+    return [t for t in raw_tokens if len(t) >= 3 or t not in STOP_2LETTER]
+
+
+def extract_locality_token(norm_addr: str) -> str:
+    """Extracts trailing locality / city word token (len >= 3, alphabetic)."""
+    if not norm_addr:
+        return ""
+    words = re.findall(r'\b[a-z]{3,}\b', norm_addr)
+    return words[-1] if words else ""
+
 
 class LexicalBlocker:
     """
     High-recall sparse blocker using inverted token indexes, character 3-grams,
-    and exact postal/locality keys.
+    guarded 2-letter brands, and composite locality/postal keys.
     """
-    def __init__(self, min_token_len: int = 3, max_candidates_per_entity: int = 25):
+    def __init__(self, min_token_len: int = 3, max_candidates_per_entity: int = MAX_CANDIDATES_PER_ENTITY):
         self.min_token_len = min_token_len
         self.max_candidates = max_candidates_per_entity
         self.token_index = defaultdict(list)
         self.postal_index = defaultdict(list)
+        self.locality_index = defaultdict(list)
         self.target_records = {}
 
     def fit(self, target_df: pd.DataFrame):
-        """Builds multi-key inverted indexes on target records (Sources 2 and 3)."""
+        """Builds multi-tier inverted indexes on target records (Sources 2 and 3)."""
         self.token_index.clear()
         self.postal_index.clear()
+        self.locality_index.clear()
         self.target_records.clear()
 
         eids = target_df['entity_id'].tolist()
@@ -43,18 +72,19 @@ class LexicalBlocker:
         for eid, norm_name, norm_addr, postal in zip(eids, norm_names, norm_addrs, postals):
             self.target_records[eid] = norm_name
 
-            # 1. Whole word tokens from name (support 2+ char tokens e.g. 3M, GE, HP, Om)
-            words = re.findall(r'\b[a-z0-9]{2,}\b', norm_name)
+            # 1. Significant brand tokens (including guarded 2-letter brands)
+            words = extract_brand_tokens(norm_name)
             for w in set(words):
                 self.token_index[w].append(eid)
 
             # Prefix token of the brand name (first 3 chars)
-            if norm_name:
-                self.token_index[f"^_{norm_name[:3]}"].append(eid)
+            prefix3 = norm_name[:3] if norm_name else ""
+            if prefix3:
+                self.token_index[f"^_{prefix3}"].append(eid)
 
-            # 2. Character 3-grams of significant name words (captures typos/misspellings)
+            # 2. Character 3-grams for words >= 4 characters (captures typos/misspellings)
             for w in words:
-                if len(w) >= 3:
+                if len(w) >= 4:
                     for i in range(len(w) - 2):
                         self.token_index[w[i:i+3]].append(eid)
 
@@ -62,7 +92,15 @@ class LexicalBlocker:
             if postal:
                 self.postal_index[postal].append(eid)
 
-            # 4. Street name tokens from address (if available)
+            # 4. Composite locality keys (robust against >93% missing postal codes)
+            city_tok = extract_locality_token(norm_addr)
+            if prefix3:
+                if postal:
+                    self.locality_index[f"loc_{prefix3}_{postal}"].append(eid)
+                elif city_tok:
+                    self.locality_index[f"loc_{prefix3}_{city_tok}"].append(eid)
+
+            # 5. Street name tokens from address (if available)
             addr_words = re.findall(r'\b[a-z]{4,}\b', norm_addr)
             for aw in set(addr_words[:3]):
                 self.token_index[f"addr_{aw}"].append(eid)
@@ -70,26 +108,36 @@ class LexicalBlocker:
     def retrieve_candidates(self, query_norm_name: str, query_norm_addr: str, query_postal: str) -> List[Tuple[str, float]]:
         """Retrieves candidate target IDs for a single S1 entity using multi-signal keys."""
         candidate_scores = defaultdict(int)
-        words = re.findall(r'\b[a-z0-9]{2,}\b', query_norm_name)
+        words = extract_brand_tokens(query_norm_name)
+        prefix3 = query_norm_name[:3] if query_norm_name else ""
 
-        # 1. Whole word matches (High Weight)
+        # 1. Whole word matches (High Weight, capped at DF < 15,000)
         for w in set(words):
             target_ids = self.token_index.get(w, [])
-            if len(target_ids) < 3000:
+            if len(target_ids) < 15000:
                 for tid in target_ids:
                     candidate_scores[tid] += 5
 
         # Brand prefix match (First 3 characters)
-        if query_norm_name:
-            prefix_targets = self.token_index.get(f"^_{query_norm_name[:3]}", [])
+        if prefix3:
+            prefix_targets = self.token_index.get(f"^_{prefix3}", [])
             if len(prefix_targets) < 2500:
                 for tid in prefix_targets:
                     candidate_scores[tid] += 3
 
-        # 2. Character 3-gram matches (Typos / Substring overlap)
+        # 2. Composite Locality Match (High Selectivity Key)
+        city_tok = extract_locality_token(query_norm_addr)
+        loc_key = f"loc_{prefix3}_{query_postal}" if query_postal else (f"loc_{prefix3}_{city_tok}" if city_tok else None)
+        if loc_key:
+            loc_targets = self.locality_index.get(loc_key, [])
+            if len(loc_targets) < 500:
+                for tid in loc_targets:
+                    candidate_scores[tid] += 6
+
+        # 3. Character 3-gram matches (Typos / Substring overlap, for words >= 4 chars)
         tri_seen = set()
         for w in words:
-            if len(w) >= 3:
+            if len(w) >= 4:
                 for i in range(len(w) - 2):
                     tri = w[i:i+3]
                     if tri not in tri_seen:
@@ -99,14 +147,14 @@ class LexicalBlocker:
                             for tid in target_ids:
                                 candidate_scores[tid] += 1
 
-        # 3. Exact postal matches (Medium Weight)
+        # 4. Exact postal matches
         if query_postal:
             postal_targets = self.postal_index.get(query_postal, [])
             if len(postal_targets) < 500:
                 for tid in postal_targets:
                     candidate_scores[tid] += 4
 
-        # 4. Street name matches from address
+        # 5. Street name matches from address
         if query_norm_addr:
             addr_words = re.findall(r'\b[a-z]{4,}\b', query_norm_addr)
             for aw in set(addr_words[:3]):
@@ -187,7 +235,7 @@ class DenseBlocker:
 def run_hybrid_blocking(
     s1_df: pd.DataFrame,
     s23_df: pd.DataFrame,
-    max_candidates_per_entity: int = 35,
+    max_candidates_per_entity: int = MAX_CANDIDATES_PER_ENTITY,
     dense_model_name: Optional[str] = None
 ) -> Dict[str, Set[str]]:
     """

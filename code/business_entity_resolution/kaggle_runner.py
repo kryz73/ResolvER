@@ -50,7 +50,7 @@ def main():
         OUTPUT_DIR, OUTPUT_MATCHING_PATH, OUTPUT_CANDIDATE_PATH,
         VALIDATE_SCRIPT, TEST_DIR
     )
-    from pipeline import run_pipeline
+    from pipeline import run_pipeline, run_loco_evaluation
 
     print(f"\n[Step 2/5] Verified Dataset Paths:")
     print(f"  Dataset Root: {DATASET_ROOT}")
@@ -60,6 +60,8 @@ def main():
 
     import argparse
     parser = argparse.ArgumentParser(description="Kaggle Runner for Business Entity Resolution")
+    parser.add_argument("--mode", type=str, default="standard", choices=["standard", "loco_check"],
+                        help="Execution mode: 'standard' or 'loco_check' (Leave-One-Country-Out France proxy)")
     parser.add_argument("--sample-size", type=int, default=None, help="Train sample size (default: None for full Kaggle dataset)")
     parser.add_argument("--use-dense", action="store_true", help="Enable dense multilingual embedding blocking")
     parser.add_argument("--skip-test", action="store_true", help="Skip test set inference (useful for fast cross-validation diagnostics)")
@@ -77,18 +79,29 @@ def main():
     device = "cuda" if has_gpu else "cpu"
     print(f"  Compute Device: {device} ({gpu_name})")
 
-    sample_desc = f"{args.sample_size:,}" if args.sample_size else "FULL DATASET"
-    test_desc = "SKIPPED (Evaluation Mode Only)" if args.skip_test else "ENABLED (Generating Submission)"
-    print(f"\n[Step 3/5] Launching Approach 4 Pipeline on {device} (Train Sample: {sample_desc}, Test Inference: {test_desc})...")
+    log_dir = "/kaggle/working/logs" if Path("/kaggle/working").exists() else "logs"
 
-    run_pipeline(
-        train_sample_size=args.sample_size,  # Full dataset or custom sample
-        test_mode=not args.skip_test,        # Generate test candidate_pairs.tsv and matching_results.tsv
-        use_dense=args.use_dense,            # Dense FAISS vector blocking flag
-        device=device,
-        log_dir="/kaggle/working/logs" if Path("/kaggle/working").exists() else "logs",
-        experiment_name="kaggle_run"
-    )
+    if args.mode == "loco_check":
+        print(f"\n[Step 3/5] Launching Leave-One-Country-Out (LOCO) Proxy Evaluation on {device}...")
+        run_loco_evaluation(
+            sample_size=args.sample_size,
+            device=device,
+            log_dir=log_dir,
+            experiment_name="kaggle_run"
+        )
+    else:
+        sample_desc = f"{args.sample_size:,}" if args.sample_size else "FULL DATASET"
+        test_desc = "SKIPPED (Evaluation Mode Only)" if args.skip_test else "ENABLED (Generating Submission)"
+        print(f"\n[Step 3/5] Launching Approach 4 Pipeline on {device} (Train Sample: {sample_desc}, Test Inference: {test_desc})...")
+
+        run_pipeline(
+            train_sample_size=args.sample_size,  # Full dataset or custom sample
+            test_mode=not args.skip_test,        # Generate test candidate_pairs.tsv and matching_results.tsv
+            use_dense=args.use_dense,            # Dense FAISS vector blocking flag
+            device=device,
+            log_dir=log_dir,
+            experiment_name="kaggle_run"
+        )
 
 
     # 4. Display Diagnostic Results in Kaggle

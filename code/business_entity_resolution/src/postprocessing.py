@@ -51,16 +51,63 @@ def evaluate_macro_f05(
     return total_score / float(len(all_s1_ids)) if all_s1_ids else 0.0
 
 
+from config import (
+    TAU_SWEEP_MIN, TAU_SWEEP_MAX, TAU_SWEEP_STEP,
+    SINGLETON_SWEEP_MIN, SINGLETON_SWEEP_MAX, SINGLETON_SWEEP_STEP
+)
+
+
+def evaluate_stratified_f05(
+    predictions: Dict[str, Set[str]],
+    ground_truth: Dict[str, Set[str]],
+    all_s1_ids: List[str]
+) -> Dict[str, float]:
+    """
+    Computes overall Macro F0.5 and stratified breakdown across:
+    1. Singletons (0 true matches)
+    2. Single-match entities (1 true match)
+    3. Multi-match entities (2-11 true matches)
+    """
+    singleton_scores = []
+    single_match_scores = []
+    multi_match_scores = []
+    all_scores = []
+
+    for s1_id in all_s1_ids:
+        preds = predictions.get(s1_id, set())
+        trues = ground_truth.get(s1_id, set())
+        score = compute_f05_score(preds, trues)
+        all_scores.append(score)
+
+        if not trues:
+            singleton_scores.append(score)
+        elif len(trues) == 1:
+            single_match_scores.append(score)
+        else:
+            multi_match_scores.append(score)
+
+    return {
+        "overall_f05": float(np.mean(all_scores)) if all_scores else 0.0,
+        "singleton_f05": float(np.mean(singleton_scores)) if singleton_scores else 0.0,
+        "single_match_f05": float(np.mean(single_match_scores)) if single_match_scores else 0.0,
+        "multi_match_f05": float(np.mean(multi_match_scores)) if multi_match_scores else 0.0,
+        "n_singletons": len(singleton_scores),
+        "n_single_match": len(single_match_scores),
+        "n_multi_match": len(multi_match_scores),
+        "n_total": len(all_scores)
+    }
+
+
 def tune_decision_thresholds(
     candidate_pairs: List[Tuple[str, str]],
     pred_probs: np.ndarray,
     ground_truth: Dict[str, Set[str]],
     all_s1_ids: List[str]
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, List[Dict]]:
     """
     Grid-searches the optimal decision threshold (tau) and singleton threshold (tau_single)
     to directly maximize the Macro F0.5 evaluation metric on OOF validation predictions.
-    Returns: (best_tau, best_tau_single, best_macro_f05)
+    Returns: (best_tau, best_tau_single, best_macro_f05, tuning_records)
     """
     # Group predictions by S1 entity
     entity_candidates = defaultdict(list)
@@ -70,12 +117,13 @@ def tune_decision_thresholds(
     best_score = -1.0
     best_tau = 0.82
     best_tau_single = 0.75
+    best_preds = {}
     tuning_records = []
 
-    tau_range = np.linspace(0.35, 0.85, 26)
-    singleton_range = np.linspace(0.30, 0.80, 21)
+    tau_range = np.arange(TAU_SWEEP_MIN, TAU_SWEEP_MAX + 1e-5, TAU_SWEEP_STEP)
+    singleton_range = np.arange(SINGLETON_SWEEP_MIN, SINGLETON_SWEEP_MAX + 1e-5, SINGLETON_SWEEP_STEP)
 
-    print("  [Threshold Tuning] Grid searching (tau, tau_single) on validation Macro F0.5...")
+    print(f"  [Threshold Tuning] Grid searching tau in [{TAU_SWEEP_MIN:.2f}, {TAU_SWEEP_MAX:.2f}] & tau_single in [{SINGLETON_SWEEP_MIN:.2f}, {SINGLETON_SWEEP_MAX:.2f}]...")
     for tau in tau_range:
         for tau_single in singleton_range:
             preds = {}
@@ -104,8 +152,16 @@ def tune_decision_thresholds(
                 best_score = score
                 best_tau = float(tau)
                 best_tau_single = float(tau_single)
+                best_preds = preds
 
+    strat = evaluate_stratified_f05(best_preds, ground_truth, all_s1_ids)
     print(f"  [Threshold Tuning] Best Macro F0.5 = {best_score:.4f} (tau={best_tau:.3f}, tau_single={best_tau_single:.3f})")
+    print(f"    Stratified Breakdown:")
+    print(f"      - Overall Macro F0.5:     {strat['overall_f05']:.4f}")
+    print(f"      - Singletons ({strat['n_singletons']:,}):       {strat['singleton_f05']:.4f}")
+    print(f"      - 1-Match Entities ({strat['n_single_match']:,}): {strat['single_match_f05']:.4f}")
+    print(f"      - Multi-Match ({strat['n_multi_match']:,}):      {strat['multi_match_f05']:.4f}")
+
     return best_tau, best_tau_single, best_score, tuning_records
 
 

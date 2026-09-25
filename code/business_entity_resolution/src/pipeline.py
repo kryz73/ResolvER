@@ -302,8 +302,133 @@ def run_pipeline(
             tracker.log(f">> Note: Validator script not found at {VALIDATE_SCRIPT}. Skipping automated check. <<")
 
 
+def run_loco_evaluation(
+    sample_size: Optional[int] = None,
+    device: str = "cpu",
+    log_dir: str = "logs",
+    experiment_name: Optional[str] = "loco_france_proxy"
+):
+    """
+    Leave-One-Country-Out (LOCO) France Proxy Validation Protocol:
+    1. Trains Asymmetric LightGBM strictly on US data.
+    2. Validates domain transfer on India data (unseen country).
+    3. Evaluates Macro F0.5 with stratified singleton/multi-match breakdown.
+    This serves as an empirical verification of domain transfer for zero-shot France.
+    """
+    tracker = ExperimentTracker(log_dir=log_dir, experiment_name=experiment_name)
+    tracker.log("=" * 80)
+    tracker.log("LEAVE-ONE-COUNTRY-OUT (LOCO) DOMAIN-TRANSFER VALIDATION (US -> INDIA)")
+    tracker.log("=" * 80)
+    tracker.log("Empirical validation of language/domain invariance for zero-shot France test set.")
+
+    # 1. Load data
+    tracker.start_timer("loco_data_loading")
+    s1_full = pd.read_csv(TRAIN_S1_PATH, sep="\t")
+    gt_all = load_ground_truth(str(TRAIN_GT_PATH))
+
+    # Split by country
+    s1_us = s1_full[s1_full['country'] == 'US'].reset_index(drop=True)
+    s1_in = s1_full[s1_full['country'] == 'India'].reset_index(drop=True)
+
+    if sample_size:
+        half_sample = max(100, sample_size // 2)
+        s1_us = s1_us.sample(n=min(len(s1_us), half_sample), random_state=42).reset_index(drop=True)
+        s1_in = s1_in.sample(n=min(len(s1_in), half_sample), random_state=42).reset_index(drop=True)
+
+    tracker.log(f"Training Domain [US]: {len(s1_us):,} entities | Validation Domain [India]: {len(s1_in):,} entities")
+
+    gt_us = {sid: gt_all[sid] for sid in s1_us['entity_id'] if sid in gt_all}
+    gt_in = {sid: gt_all[sid] for sid in s1_in['entity_id'] if sid in gt_all}
+
+    # Collect target IDs
+    needed_targets = set()
+    for s in list(gt_us.values()) + list(gt_in.values()):
+        needed_targets.update(s)
+
+    # Load targets (Sources 2 and 3)
+    s2_chunks = []
+    for chunk in pd.read_csv(TRAIN_S2_PATH, sep="\t", chunksize=250000):
+        hits = chunk[chunk['entity_id'].isin(needed_targets)]
+        distractors = chunk[~chunk['entity_id'].isin(needed_targets)].sample(frac=0.015, random_state=42)
+        s2_chunks.append(pd.concat([hits, distractors]))
+        if sum(len(c) for c in s2_chunks) > 120000:
+            break
+    s2_sample = pd.concat(s2_chunks, ignore_index=True)
+
+    s3_chunks = []
+    for chunk in pd.read_csv(TRAIN_S3_PATH, sep="\t", chunksize=250000):
+        hits = chunk[chunk['entity_id'].isin(needed_targets)]
+        distractors = chunk[~chunk['entity_id'].isin(needed_targets)].sample(frac=0.015, random_state=42)
+        s3_chunks.append(pd.concat([hits, distractors]))
+        if sum(len(c) for c in s3_chunks) > 120000:
+            break
+    s3_sample = pd.concat(s3_chunks, ignore_index=True)
+    s23_df = pd.concat([s2_sample, s3_sample], ignore_index=True).drop_duplicates(subset=['entity_id'])
+
+    # Preprocess
+    s1_us_proc = preprocess_dataframe(s1_us, is_reference=True)
+    s1_in_proc = preprocess_dataframe(s1_in, is_reference=True)
+    s23_proc = preprocess_dataframe(s23_df, is_reference=False)
+    tracker.stop_timer("loco_data_loading")
+
+    # 2. Blocking on US (Train) and India (Validation)
+    tracker.start_timer("loco_blocking")
+    s23_us = s23_proc[s23_proc['country'] == 'US']
+    s23_in = s23_proc[s23_proc['country'] == 'India']
+
+    tracker.log("Blocking US training entities...")
+    us_cands = run_hybrid_blocking(s1_us_proc, s23_us, max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY)
+    tracker.log("Blocking India validation entities...")
+    in_cands = run_hybrid_blocking(s1_in_proc, s23_in, max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY)
+    tracker.stop_timer("loco_blocking")
+
+    # 3. Features & Train on US
+    tracker.start_timer("loco_training")
+    us_pairs, us_labels = [], []
+    for s1_id, c_set in us_cands.items():
+        true_set = gt_us.get(s1_id, set())
+        for tid in c_set:
+            us_pairs.append((s1_id, tid))
+            us_labels.append(1 if tid in true_set else 0)
+
+    X_us, feat_names = build_feature_matrix(us_pairs, s1_us_proc, s23_us)
+    y_us = np.array(us_labels, dtype=np.int32)
+    tracker.log(f"US Training Pairs: {len(X_us):,} with {len(feat_names)} domain-invariant features.")
+
+    matcher = AsymmetricEntityMatcher(device=device)
+    matcher.fit(X_us, y_us, feature_names=feat_names)
+    tracker.stop_timer("loco_training")
+
+    # 4. Predict on India & Tune Thresholds
+    tracker.start_timer("loco_evaluation")
+    in_pairs, in_labels = [], []
+    for s1_id, c_set in in_cands.items():
+        true_set = gt_in.get(s1_id, set())
+        for tid in c_set:
+            in_pairs.append((s1_id, tid))
+            in_labels.append(1 if tid in true_set else 0)
+
+    X_in, _ = build_feature_matrix(in_pairs, s1_in_proc, s23_in)
+    in_probs = matcher.predict_proba(X_in)
+    tracker.log(f"India Validation Pairs: {len(X_in):,}")
+
+    in_s1_ids = s1_in['entity_id'].tolist()
+    best_tau, best_tau_single, val_macro_f05, _ = tune_decision_thresholds(
+        in_pairs, in_probs, gt_in, in_s1_ids
+    )
+
+    tracker.log("\n" + "=" * 80)
+    tracker.log(f">> LOCO ZERO-SHOT TRANSFER (US -> INDIA) MACRO F0.5 = {val_macro_f05:.4f} <<")
+    tracker.log(f">> Optimal Operating Thresholds: tau={best_tau:.3f}, tau_singleton={best_tau_single:.3f} <<")
+    tracker.log("=" * 80)
+    tracker.stop_timer("loco_evaluation")
+    tracker.finalize(val_macro_f05, best_tau, best_tau_single)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="2026 Amazon Entity Resolution — Approach 4 Pipeline")
+    parser.add_argument("--mode", type=str, default="standard", choices=["standard", "loco_check"],
+                        help="Execution mode: 'standard' (full/CV pipeline) or 'loco_check' (Leave-One-Country-Out France proxy)")
     parser.add_argument("--sample-size", type=int, default=None, help="Train sample size (default: None for full dataset on Cloud GPU)")
     parser.add_argument("--test", action="store_true", help="Run full test set inference and generate submission TSVs")
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"], help="Compute device for models (cpu or cuda)")
@@ -314,12 +439,20 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    run_pipeline(
-        train_sample_size=args.sample_size,
-        test_mode=args.test,
-        use_dense=args.use_dense,
-        dense_model_name=args.dense_model,
-        device=args.device,
-        log_dir=args.log_dir,
-        experiment_name=args.exp_name
-    )
+    if args.mode == "loco_check":
+        run_loco_evaluation(
+            sample_size=args.sample_size,
+            device=args.device,
+            log_dir=args.log_dir,
+            experiment_name=args.exp_name or "loco_france_proxy"
+        )
+    else:
+        run_pipeline(
+            train_sample_size=args.sample_size,
+            test_mode=args.test,
+            use_dense=args.use_dense,
+            dense_model_name=args.dense_model,
+            device=args.device,
+            log_dir=args.log_dir,
+            experiment_name=args.exp_name
+        )

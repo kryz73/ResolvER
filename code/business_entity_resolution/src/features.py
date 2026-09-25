@@ -125,12 +125,10 @@ def extract_pairwise_features(
     feats['is_source_2'] = 1.0 if target_id.startswith('S2-') else 0.0
     feats['is_source_3'] = 1.0 if target_id.startswith('S3-') else 0.0
 
-    # ── 6. Country Indicators ─────────────────────────────────────────────
-    feats['country_us'] = 1.0 if country == 'US' else 0.0
-    feats['country_india'] = 1.0 if country == 'India' else 0.0
-    feats['country_france'] = 1.0 if country == 'France' else 0.0
+    # (Note: Raw country one-hot indicators are omitted to enforce complete
+    # domain and language invariance for zero-shot generalization to France)
 
-    # ── 7. Semantic Embedding Distance ────────────────────────────────────
+    # ── 6. Semantic Embedding Distance ────────────────────────────────────
     if sbert_sim is not None:
         feats['sbert_cosine'] = float(sbert_sim)
 
