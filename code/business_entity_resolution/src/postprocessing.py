@@ -72,8 +72,8 @@ def tune_decision_thresholds(
     best_tau_single = 0.75
     tuning_records = []
 
-    tau_range = np.linspace(0.65, 0.92, 14)
-    singleton_range = np.linspace(0.60, 0.85, 6)
+    tau_range = np.linspace(0.35, 0.85, 26)
+    singleton_range = np.linspace(0.30, 0.80, 21)
 
     print("  [Threshold Tuning] Grid searching (tau, tau_single) on validation Macro F0.5...")
     for tau in tau_range:

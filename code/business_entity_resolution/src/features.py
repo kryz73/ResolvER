@@ -61,10 +61,12 @@ def extract_pairwise_features(
     feats['name_token_jaccard'] = jaccard_similarity(w1, w2)
     feats['name_3gram_jaccard'] = jaccard_similarity(char_ngrams(n1, 3), char_ngrams(n2, 3))
 
-    # Prefix match
+    # Prefix match & Brand Discriminators
     first_w1 = n1.split()[0] if n1 else ""
     first_w2 = n2.split()[0] if n2 else ""
     feats['name_first_word_match'] = 1.0 if first_w1 and first_w1 == first_w2 else 0.0
+    feats['first_word_ratio'] = fuzz.ratio(first_w1, first_w2) / 100.0 if (first_w1 and first_w2) else 0.0
+    feats['first_letter_match'] = 1.0 if (first_w1 and first_w2 and first_w1[0] == first_w2[0]) else 0.0
 
     # Length discrepancies
     l1, l2 = len(n1), len(n2)
@@ -98,16 +100,20 @@ def extract_pairwise_features(
     if nums1 and nums2:
         feats['number_overlap_jaccard'] = jaccard_similarity(nums1, nums2)
         feats['has_number_exact_match'] = 1.0 if len(nums1 & nums2) > 0 else 0.0
+        feats['has_number_conflict'] = 1.0 if len(nums1 & nums2) == 0 else 0.0
     else:
         feats['number_overlap_jaccard'] = 0.5
         feats['has_number_exact_match'] = 0.5
+        feats['has_number_conflict'] = 0.0
 
     p1 = str(s1_row.get('postal_code', '')).strip()
     p2 = str(target_row.get('postal_code', '')).strip()
     if p1 and p2:
         feats['postal_exact_match'] = 1.0 if p1 == p2 else 0.0
+        feats['postal_conflict'] = 1.0 if p1 != p2 else 0.0
     else:
         feats['postal_exact_match'] = 0.5
+        feats['postal_conflict'] = 0.0
 
     # ── 4. Franchise & Name Frequency Interaction ─────────────────────────
     feats['name_log_freq'] = math.log1p(s1_name_freq)

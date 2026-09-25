@@ -43,14 +43,18 @@ class LexicalBlocker:
         for eid, norm_name, norm_addr, postal in zip(eids, norm_names, norm_addrs, postals):
             self.target_records[eid] = norm_name
 
-            # 1. Whole word tokens from name
-            words = re.findall(r'\b[a-z0-9]{3,}\b', norm_name)
+            # 1. Whole word tokens from name (support 2+ char tokens e.g. 3M, GE, HP, Om)
+            words = re.findall(r'\b[a-z0-9]{2,}\b', norm_name)
             for w in set(words):
                 self.token_index[w].append(eid)
 
+            # Prefix token of the brand name (first 3 chars)
+            if norm_name:
+                self.token_index[f"^_{norm_name[:3]}"].append(eid)
+
             # 2. Character 3-grams of significant name words (captures typos/misspellings)
             for w in words:
-                if len(w) >= 4:
+                if len(w) >= 3:
                     for i in range(len(w) - 2):
                         self.token_index[w[i:i+3]].append(eid)
 
@@ -66,7 +70,7 @@ class LexicalBlocker:
     def retrieve_candidates(self, query_norm_name: str, query_norm_addr: str, query_postal: str) -> List[Tuple[str, float]]:
         """Retrieves candidate target IDs for a single S1 entity using multi-signal keys."""
         candidate_scores = defaultdict(int)
-        words = re.findall(r'\b[a-z0-9]{3,}\b', query_norm_name)
+        words = re.findall(r'\b[a-z0-9]{2,}\b', query_norm_name)
 
         # 1. Whole word matches (High Weight)
         for w in set(words):
@@ -75,10 +79,17 @@ class LexicalBlocker:
                 for tid in target_ids:
                     candidate_scores[tid] += 5
 
+        # Brand prefix match (First 3 characters)
+        if query_norm_name:
+            prefix_targets = self.token_index.get(f"^_{query_norm_name[:3]}", [])
+            if len(prefix_targets) < 2500:
+                for tid in prefix_targets:
+                    candidate_scores[tid] += 3
+
         # 2. Character 3-gram matches (Typos / Substring overlap)
         tri_seen = set()
         for w in words:
-            if len(w) >= 4:
+            if len(w) >= 3:
                 for i in range(len(w) - 2):
                     tri = w[i:i+3]
                     if tri not in tri_seen:
@@ -184,7 +195,7 @@ def run_hybrid_blocking(
     Returns: mapping {source1_entity_id: set(candidate_target_ids)}
     """
     print(f"  [Blocking] Building sparse lexical index over {len(s23_df):,} target records...")
-    lex_blocker = LexicalBlocker(max_candidates_per_entity=25)
+    lex_blocker = LexicalBlocker(max_candidates_per_entity=max_candidates_per_entity)
     lex_blocker.fit(s23_df)
 
     candidates_per_s1: Dict[str, Set[str]] = defaultdict(set)

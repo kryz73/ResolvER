@@ -60,19 +60,9 @@ def detect_validate_script() -> Path:
     if local_script.exists():
         return local_script
 
-    for cand in [
-        Path("./utils/validate_submission.py"),
-        Path("../utils/validate_submission.py"),
-        Path("../../student_resource/utils/validate_submission.py"),
-        Path("../../../student_resource/utils/validate_submission.py"),
-        Path("/kaggle/working/tea-ml/student_resource/utils/validate_submission.py")
-    ]:
+    for cand in [Path("./utils/validate_submission.py"), Path("../utils/validate_submission.py")]:
         if cand.exists():
             return cand.resolve()
-
-    if Path("/kaggle/working").exists():
-        for p in Path("/kaggle/working").rglob("validate_submission.py"):
-            return p
 
     return Path("validate_submission.py")
 
@@ -133,8 +123,8 @@ TEST_COUNTRIES = ["US", "India", "France"]
 
 # Cardinality Bounds
 MAX_MATCHES_PER_ENTITY = 11  # Absolute empirical ceiling from ground truth
-MAX_CANDIDATES_PER_ENTITY = 35  # Blocking budget per S1 entity
-MIN_SIMILARITY_BLOCKING = 0.60  # Dense cosine cutoff to prevent candidate flooding
+MAX_CANDIDATES_PER_ENTITY = 40  # Blocking budget per S1 entity
+MIN_SIMILARITY_BLOCKING = 0.55  # Dense cosine cutoff to prevent candidate flooding
 
 # Metric Optimization
 BETA = 0.5  # F_0.5 weighting (precision weighted 2x over recall)
