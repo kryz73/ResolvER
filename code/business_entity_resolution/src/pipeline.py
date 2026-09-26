@@ -10,6 +10,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from collections import defaultdict
 from typing import Dict, List, Set, Tuple, Optional
 import numpy as np
 import pandas as pd
@@ -25,7 +26,10 @@ from config import (
     SBERT_MODEL_NAME
 )
 from preprocessing import preprocess_dataframe
-from blocking import run_hybrid_blocking, write_candidate_pairs_tsv
+from blocking import (
+    run_hybrid_blocking, write_candidate_pairs_tsv,
+    fit_hybrid_blocker, query_hybrid_blocker
+)
 from features import build_feature_matrix
 from model import AsymmetricEntityMatcher, train_5fold_cv
 from postprocessing import (
@@ -47,6 +51,7 @@ def load_ground_truth(gt_path: str) -> Dict[str, Set[str]]:
 def run_pipeline(
     train_sample_size: Optional[int] = None,
     test_mode: bool = False,
+    test_sample_size: Optional[int] = None,
     use_dense: bool = False,
     dense_model_name: str = SBERT_MODEL_NAME,
     device: str = "cpu",
@@ -124,16 +129,34 @@ def run_pipeline(
         s3_sample = pd.concat(s3_hits + s3_distractors, ignore_index=True)
         s23_train = pd.concat([s2_sample, s3_sample], ignore_index=True).drop_duplicates(subset=['entity_id'])
     else:
-        tracker.log("Loading complete target tables (Sources 2 and 3)...")
-        s2_full = pd.read_csv(TRAIN_S2_PATH, sep="\t")
-        s3_full = pd.read_csv(TRAIN_S3_PATH, sep="\t")
+        tracker.log("Loading complete target tables (Sources 2 and 3) via streaming...")
+        s2_chunks = []
+        for chunk in tqdm(pd.read_csv(TRAIN_S2_PATH, sep="\t", chunksize=500_000),
+                          desc="  [Data] Streaming Source 2"):
+            s2_chunks.append(chunk)
+        s2_full = pd.concat(s2_chunks, ignore_index=True)
+        del s2_chunks
+
+        s3_chunks = []
+        for chunk in tqdm(pd.read_csv(TRAIN_S3_PATH, sep="\t", chunksize=500_000),
+                          desc="  [Data] Streaming Source 3"):
+            s3_chunks.append(chunk)
+        s3_full = pd.concat(s3_chunks, ignore_index=True)
+        del s3_chunks
+
         s23_train = pd.concat([s2_full, s3_full], ignore_index=True).drop_duplicates(subset=['entity_id'])
+        del s2_full, s3_full
 
     tracker.log(f"Loaded: {len(s1_train):,} Reference S1 | {len(s23_train):,} Target Records (S2+S3)")
 
+    # Determine whether to drop raw columns (save memory on large datasets)
+    n_targets_total = len(s23_train)
+    drop_raw = n_targets_total > 100_000
     tracker.log("Executing high-speed vectorized text cleaning, transliteration, and postal normalization...")
-    s1_train_proc = preprocess_dataframe(s1_train, is_reference=True)
-    s23_train_proc = preprocess_dataframe(s23_train, is_reference=False)
+    s1_train_proc = preprocess_dataframe(s1_train, is_reference=True, drop_raw_columns=drop_raw)
+    s23_train_proc = preprocess_dataframe(s23_train, is_reference=False, drop_raw_columns=drop_raw)
+    del s23_train
+    import gc; gc.collect()
     tracker.stop_timer("data_loading_and_preprocessing")
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -167,7 +190,7 @@ def run_pipeline(
         total_candidate_pairs += len(c_set)
 
     pair_completeness = (captured_matches / total_true_matches * 100.0) if total_true_matches > 0 else 0.0
-    total_cartesian = float(len(s1_train)) * float(len(s23_train))
+    total_cartesian = float(len(s1_train)) * float(n_targets_total)
     reduction_ratio = (1.0 - (float(total_candidate_pairs) / total_cartesian)) * 100.0 if total_cartesian > 0 else 100.0
     candidates_per_entity = total_candidate_pairs / float(len(s1_train)) if len(s1_train) > 0 else 0.0
 
@@ -274,7 +297,7 @@ def run_pipeline(
     # Error Analysis Diagnostic Dump
     tracker.log("Generating Error Analysis Diagnostics (False Positives and False Negatives)...")
     tracker.dump_error_analysis(
-        pair_list, labels, oof_probs, s1_train, s23_train, tau=best_tau, top_k_errors=50
+        pair_list, labels, oof_probs, s1_train_proc, s23_train_proc, tau=best_tau, top_k_errors=50
     )
     tracker.finalize(val_macro_f05, best_tau, best_tau_single)
 
@@ -282,57 +305,194 @@ def run_pipeline(
     # PHASE 6: TEST SET INFERENCE & VALIDATION
     # ──────────────────────────────────────────────────────────────────────────
     if test_mode:
+        import gc
+        tracker.log("Freeing training memory before launching test inference...")
+        try:
+            del X, labels, oof_probs, pair_list, val_preds
+            del s1_train, s1_train_proc, s23_train_proc, all_candidates
+            del gt_all, gt_train
+        except Exception:
+            pass
+        gc.collect()
+
         tracker.start_timer("test_inference")
         tracker.log("\n" + "=" * 80)
-        tracker.log("PHASE 6: FULL TEST SET INFERENCE & SUBMISSION GENERATION")
+        tracker.log("PHASE 6: MEMORY-EFFICIENT SHARDED TEST INFERENCE")
         tracker.log("=" * 80)
 
-        tracker.log("Loading Test Files (including France zero-shot partition)...")
-        test_s1 = pd.read_csv(TEST_S1_PATH, sep="\t")
-        test_s2 = pd.read_csv(TEST_S2_PATH, sep="\t")
-        test_s3 = pd.read_csv(TEST_S3_PATH, sep="\t")
-        test_s23 = pd.concat([test_s2, test_s3], ignore_index=True).drop_duplicates(subset=['entity_id'])
-        tracker.log(f"Test Reference S1: {len(test_s1):,} | Test Targets: {len(test_s23):,}")
+        import gc
+        from features import extract_features_and_score_chunked
 
-        tracker.log("Preprocessing Test Records (standardizing French legal forms, street types, CEDEX)...")
-        test_s1_proc = preprocess_dataframe(test_s1, is_reference=True)
-        test_s23_proc = preprocess_dataframe(test_s23, is_reference=False)
+        test_s1_full = pd.read_csv(TEST_S1_PATH, sep="\t")
+        test_s1_ids = test_s1_full['entity_id'].tolist()
+        total_test_s1 = len(test_s1_ids)
+        tracker.log(f"Total Test S1 entities: {total_test_s1:,}")
 
-        tracker.log("Executing Test Candidate Blocking across US, India, and France...")
-        test_candidates: Dict[str, Set[str]] = {}
+        if test_sample_size and test_sample_size < total_test_s1:
+            tracker.log(f"Sampling {test_sample_size:,} Test S1 entities for dry-run verification...")
+            test_s1_to_process = test_s1_full.sample(n=test_sample_size, random_state=42).reset_index(drop=True)
+        else:
+            test_s1_to_process = test_s1_full
+
+        # Initialize output files with headers (will append per-shard results)
+        os.makedirs(os.path.dirname(str(OUTPUT_MATCHING_PATH)), exist_ok=True)
+        os.makedirs(os.path.dirname(str(OUTPUT_CANDIDATE_PATH)), exist_ok=True)
+
+        matching_header_written = False
+        candidate_header_written = False
+
+        # Track all S1 IDs that got written (to fill missing singletons at the end)
+        written_s1_ids = set()
+
         for country in ["US", "India", "France"]:
-            s1_c = test_s1_proc[test_s1_proc['country'] == country]
-            s23_c = test_s23_proc[test_s23_proc['country'] == country]
-            tracker.log(f"  Blocking Test Country [{country}]: {len(s1_c):,} S1 against {len(s23_c):,} targets...")
-            c_dict = run_hybrid_blocking(
-                s1_c, s23_c,
+            tracker.log(f"\n{'─' * 70}")
+            tracker.log(f"SHARD [{country}]: Loading, Blocking, Scoring...")
+            tracker.log(f"{'─' * 70}")
+
+            # ── 6a. Load only this country's S1 ──
+            shard_s1 = test_s1_to_process[test_s1_to_process['country'] == country].reset_index(drop=True)
+            if len(shard_s1) == 0:
+                tracker.log(f"  [{country}] No S1 entities found, skipping.")
+                continue
+            tracker.log(f"  [{country}] S1 entities: {len(shard_s1):,}")
+
+            # ── 6b. Stream-load only this country's S2+S3 targets ──
+            tracker.log(f"  [{country}] Streaming S2 targets (country filter)...")
+            s2_chunks = []
+            for chunk in tqdm(pd.read_csv(TEST_S2_PATH, sep="\t", chunksize=500_000),
+                              desc=f"  [{country}] Streaming S2", mininterval=1.0):
+                filtered = chunk[chunk['country'] == country]
+                if len(filtered) > 0:
+                    s2_chunks.append(filtered)
+            shard_s2 = pd.concat(s2_chunks, ignore_index=True) if s2_chunks else pd.DataFrame()
+            del s2_chunks
+            gc.collect()
+
+            tracker.log(f"  [{country}] Streaming S3 targets (country filter)...")
+            s3_chunks = []
+            for chunk in tqdm(pd.read_csv(TEST_S3_PATH, sep="\t", chunksize=500_000),
+                              desc=f"  [{country}] Streaming S3", mininterval=1.0):
+                filtered = chunk[chunk['country'] == country]
+                if len(filtered) > 0:
+                    s3_chunks.append(filtered)
+            shard_s3 = pd.concat(s3_chunks, ignore_index=True) if s3_chunks else pd.DataFrame()
+            del s3_chunks
+            gc.collect()
+
+            shard_s23 = pd.concat([shard_s2, shard_s3], ignore_index=True).drop_duplicates(subset=['entity_id'])
+            del shard_s2, shard_s3
+            gc.collect()
+            tracker.log(f"  [{country}] Loaded {len(shard_s23):,} target records (S2+S3)")
+
+            # ── 6c. Preprocess (drop raw columns to save memory) ──
+            tracker.log(f"  [{country}] Preprocessing...")
+            shard_s1_proc = preprocess_dataframe(shard_s1, is_reference=True, drop_raw_columns=True)
+            shard_s23_proc = preprocess_dataframe(shard_s23, is_reference=False, drop_raw_columns=True)
+            del shard_s1, shard_s23
+            gc.collect()
+
+            # ── 6d. Fit Blocker on Shard Targets ──
+            tracker.log(f"  [{country}] Indexing {len(shard_s23_proc):,} target records for blocking...")
+            lex_blocker, dense_blocker = fit_hybrid_blocker(
+                shard_s23_proc,
                 max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY,
                 dense_model_name=dense_model
             )
-            test_candidates.update(c_dict)
 
-        # Write candidate_pairs.tsv
-        test_s1_ids = test_s1['entity_id'].tolist()
-        write_candidate_pairs_tsv(test_candidates, test_s1_ids, str(OUTPUT_CANDIDATE_PATH))
+            # Build target lookup dict once for feature extraction across batches
+            target_lookup = shard_s23_proc.set_index('entity_id').to_dict('index')
 
-        tracker.log("Extracting Feature Matrix for Test Candidate Pairs...")
-        test_pairs = [(sid, tid) for sid, cset in test_candidates.items() for tid in cset]
-        X_test, _ = build_feature_matrix(test_pairs, test_s1_proc, test_s23_proc)
-        tracker.log(f"Test candidate matrix: {X_test.shape[0]:,} rows x {X_test.shape[1]} features.")
+            # ── 6e. Process S1 Entities in Memory-Bounded Batches ──
+            s1_batch_size = 50_000
+            n_shard_s1 = len(shard_s1_proc)
+            n_batches = int(np.ceil(n_shard_s1 / s1_batch_size))
+            tracker.log(f"  [{country}] Processing {n_shard_s1:,} S1 entities in {n_batches} batch(es) of {s1_batch_size:,}...")
 
-        tracker.log("Scoring Test Candidates via Asymmetric Matcher...")
-        test_probs = matcher.predict_proba(X_test)
+            for b_idx, b_start in enumerate(range(0, n_shard_s1, s1_batch_size), start=1):
+                b_end = min(b_start + s1_batch_size, n_shard_s1)
+                batch_s1_df = shard_s1_proc.iloc[b_start:b_end]
+                batch_s1_ids = batch_s1_df['entity_id'].tolist()
 
-        tracker.log(f"Applying Thresholds (tau={best_tau:.3f}, singleton={best_tau_single:.3f}, cap={MAX_MATCHES_PER_ENTITY})...")
-        final_test_matches = apply_decision_rules(
-            test_pairs, test_probs, test_s1_ids,
-            match_threshold=best_tau,
-            singleton_threshold=best_tau_single,
-            max_matches=MAX_MATCHES_PER_ENTITY
-        )
+                # Query blocker for this batch only
+                batch_candidates = query_hybrid_blocker(
+                    batch_s1_df, lex_blocker, dense_blocker=dense_blocker,
+                    max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY
+                )
 
-        # Write matching_results.tsv
-        write_matching_results_tsv(final_test_matches, test_s1_ids, str(OUTPUT_MATCHING_PATH))
+                # Write candidate_pairs.tsv (append mode)
+                write_mode = "w" if not candidate_header_written else "a"
+                with open(str(OUTPUT_CANDIDATE_PATH), write_mode, encoding="utf-8") as f:
+                    if not candidate_header_written:
+                        f.write("source1_entity_id\tcandidate_entity_ids\n")
+                        candidate_header_written = True
+                    for s1_id in batch_s1_ids:
+                        c_ids = batch_candidates.get(s1_id, set())
+                        if c_ids:
+                            f.write(f"{s1_id}\t{','.join(sorted(c_ids))}\n")
+                        else:
+                            f.write(f"{s1_id}\t\n")
+                        written_s1_ids.add(s1_id)
+
+                # Extract features + score in 250K chunks
+                batch_pairs = [(sid, tid) for sid, cset in batch_candidates.items() for tid in cset]
+                batch_s1_lookup = batch_s1_df.set_index('entity_id').to_dict('index')
+                batch_s1_freqs = batch_s1_df['norm_name'].value_counts().to_dict()
+
+                scored_triples = extract_features_and_score_chunked(
+                    batch_pairs, batch_s1_lookup, target_lookup, batch_s1_freqs,
+                    matcher, chunk_size=250_000
+                )
+                del batch_s1_lookup, batch_s1_freqs, batch_pairs, batch_candidates
+                gc.collect()
+
+                # Group scores by S1 entity and apply thresholds
+                entity_preds = defaultdict(list)
+                for s1_id, t_id, prob in scored_triples:
+                    entity_preds[s1_id].append((t_id, prob))
+                del scored_triples
+                gc.collect()
+
+                write_mode = "w" if not matching_header_written else "a"
+                with open(str(OUTPUT_MATCHING_PATH), write_mode, encoding="utf-8") as f:
+                    if not matching_header_written:
+                        f.write("source1_entity_id\tmatched_entity_ids\n")
+                        matching_header_written = True
+
+                    for s1_id in batch_s1_ids:
+                        c_list = entity_preds.get(s1_id, [])
+                        if not c_list:
+                            f.write(f"{s1_id}\t\n")
+                            continue
+                        max_p = max(p for _, p in c_list)
+                        if max_p < best_tau_single:
+                            f.write(f"{s1_id}\t\n")
+                        else:
+                            matches = [tid for tid, p in sorted(c_list, key=lambda x: x[1], reverse=True)
+                                       if p >= best_tau][:MAX_MATCHES_PER_ENTITY]
+                            f.write(f"{s1_id}\t{','.join(matches)}\n")
+
+                del entity_preds
+                gc.collect()
+
+            del lex_blocker, dense_blocker, target_lookup, shard_s1_proc, shard_s23_proc
+            gc.collect()
+            tracker.log(f"  [{country}] All batches complete. Memory released.")
+
+        # Fill in any S1 IDs that weren't in any shard (should be none, but defensive)
+        missing_s1 = set(test_s1_ids) - written_s1_ids
+        if missing_s1:
+            tracker.log(f"  [Cleanup] Writing {len(missing_s1):,} missing S1 IDs as singletons...")
+            with open(str(OUTPUT_MATCHING_PATH), "a", encoding="utf-8") as f:
+                for s1_id in sorted(missing_s1):
+                    f.write(f"{s1_id}\t\n")
+            with open(str(OUTPUT_CANDIDATE_PATH), "a", encoding="utf-8") as f:
+                for s1_id in sorted(missing_s1):
+                    f.write(f"{s1_id}\t\n")
+
+        del test_s1_full
+        gc.collect()
+
+        tracker.log(f"\nTest inference complete: {total_test_s1:,} S1 entities processed across 3 country shards.")
         tracker.stop_timer("test_inference")
 
         # Official Validator
@@ -480,6 +640,7 @@ if __name__ == "__main__":
                         help="Execution mode: 'standard' (full/CV pipeline) or 'loco_check' (Leave-One-Country-Out France proxy)")
     parser.add_argument("--sample-size", type=int, default=None, help="Train sample size (default: None for full dataset on Cloud GPU)")
     parser.add_argument("--test", action="store_true", help="Run full test set inference and generate submission TSVs")
+    parser.add_argument("--test-sample-size", type=int, default=None, help="Sample size for test set inference verification")
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"], help="Compute device for models (cpu or cuda)")
     parser.add_argument("--use-dense", action="store_true", help="Enable dense multilingual vector blocking (recommended on Cloud GPU)")
     parser.add_argument("--dense-model", type=str, default=SBERT_MODEL_NAME, help="HuggingFace model for dense embeddings")
@@ -499,6 +660,7 @@ if __name__ == "__main__":
         run_pipeline(
             train_sample_size=args.sample_size,
             test_mode=args.test,
+            test_sample_size=args.test_sample_size,
             use_dense=args.use_dense,
             dense_model_name=args.dense_model,
             device=args.device,

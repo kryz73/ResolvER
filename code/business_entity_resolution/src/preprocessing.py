@@ -218,7 +218,7 @@ def standardize_address(address: str, country: str) -> str:
 from tqdm import tqdm
 
 
-def preprocess_dataframe(df: pd.DataFrame, is_reference: bool = False) -> pd.DataFrame:
+def preprocess_dataframe(df: pd.DataFrame, is_reference: bool = False, drop_raw_columns: bool = False) -> pd.DataFrame:
     """
     Applies high-speed preprocessing pipeline to a source dataframe using fast zip iteration:
     Adds:
@@ -227,6 +227,9 @@ def preprocess_dataframe(df: pd.DataFrame, is_reference: bool = False) -> pd.Dat
       - 'norm_address': standardized address string
       - 'postal_code': extracted postal code (if found)
       - 'address_missing': boolean flag for missing address
+
+    If drop_raw_columns=True, drops the original 'business_name' and 'business_address'
+    columns after preprocessing to free memory (~3GB on 10M-row DataFrames).
     """
     df = df.copy()
     names = df['business_name'].fillna('').astype(str).tolist()
@@ -262,6 +265,11 @@ def preprocess_dataframe(df: pd.DataFrame, is_reference: bool = False) -> pd.Dat
     df['norm_name'] = norm_names
     df['norm_address'] = norm_addrs
     df['postal_code'] = postals
+
+    if drop_raw_columns:
+        for col in ['business_name', 'business_address']:
+            if col in df.columns:
+                df.drop(columns=[col], inplace=True)
 
     return df
 

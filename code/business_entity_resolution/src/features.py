@@ -177,3 +177,58 @@ def build_feature_matrix(
     X = np.array(feature_rows, dtype=np.float32) if feature_rows else np.empty((0, len(feature_names or [])))
     return X, feature_names or []
 
+
+def extract_features_and_score_chunked(
+    candidate_pairs: List[Tuple[str, str]],
+    s1_lookup: Dict[str, Dict],
+    target_lookup: Dict[str, Dict],
+    s1_name_freqs: Dict[str, int],
+    matcher,
+    chunk_size: int = 500_000
+) -> List[Tuple[str, str, float]]:
+    """
+    Memory-efficient feature extraction + scoring pipeline.
+    Processes pairs in fixed-size chunks, scoring each chunk immediately
+    and discarding the feature matrix. Never materializes the full N×29 array.
+
+    Returns: list of (s1_id, target_id, prob) for all valid pairs.
+    """
+    results = []
+    total = len(candidate_pairs)
+    feature_names = None
+
+    for start in tqdm(range(0, total, chunk_size),
+                      desc=f"  [Features+Score] Chunked ({total:,} pairs, {chunk_size//1000}K/chunk)",
+                      mininterval=1.0):
+        end = min(start + chunk_size, total)
+        chunk_pairs = candidate_pairs[start:end]
+
+        chunk_rows = []
+        valid_pairs = []
+        for s1_id, t_id in chunk_pairs:
+            if s1_id not in s1_lookup or t_id not in target_lookup:
+                continue
+            s1_row = s1_lookup[s1_id]
+            t_row = target_lookup[t_id]
+            freq = s1_name_freqs.get(s1_row.get('norm_name', ''), 1)
+
+            feats = extract_pairwise_features(s1_row, t_row, s1_name_freq=freq)
+            if feature_names is None:
+                feature_names = sorted(feats.keys())
+            chunk_rows.append([feats[k] for k in feature_names])
+            valid_pairs.append((s1_id, t_id))
+
+        if not chunk_rows:
+            continue
+
+        X_chunk = np.array(chunk_rows, dtype=np.float32)
+        probs = matcher.predict_proba(X_chunk)
+
+        for (s1_id, t_id), prob in zip(valid_pairs, probs):
+            results.append((s1_id, t_id, float(prob)))
+
+        # Explicitly free the chunk arrays
+        del X_chunk, chunk_rows, valid_pairs
+
+    return results
+

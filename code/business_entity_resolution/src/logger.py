@@ -136,10 +136,14 @@ class ExperimentTracker:
     ):
         """
         Dumps diagnostic tables of False Positives and False Negatives
-        with their raw names, addresses, similarity scores, and probabilities.
+        with their names, addresses, similarity scores, and probabilities.
+        Memory-efficient: only indexes target records involved in candidate pairs.
         """
+        needed_target_ids = {t_id for _, t_id in candidate_pairs}
+        target_subset = target_df[target_df["entity_id"].isin(needed_target_ids)]
+
         s1_lookup = s1_df.set_index("entity_id").to_dict("index")
-        target_lookup = target_df.set_index("entity_id").to_dict("index")
+        target_lookup = target_subset.set_index("entity_id").to_dict("index")
 
         fp_records = []
         fn_records = []
@@ -152,15 +156,20 @@ class ExperimentTracker:
             s1 = s1_lookup[s1_id]
             tg = target_lookup[t_id]
 
+            s1_name = s1.get("business_name") or s1.get("norm_name") or s1.get("clean_name", "")
+            tg_name = tg.get("business_name") or tg.get("norm_name") or tg.get("clean_name", "")
+            s1_addr = s1.get("business_address") or s1.get("norm_address", "")
+            tg_addr = tg.get("business_address") or tg.get("norm_address", "")
+
             rec = {
                 "s1_id": s1_id,
                 "target_id": t_id,
                 "country": s1.get("country", ""),
                 "prob": round(float(p_pred), 4),
-                "s1_name": s1.get("business_name", ""),
-                "target_name": tg.get("business_name", ""),
-                "s1_address": s1.get("business_address", ""),
-                "target_address": tg.get("business_address", "")
+                "s1_name": s1_name,
+                "target_name": tg_name,
+                "s1_address": s1_addr,
+                "target_address": tg_addr
             }
 
             if y_true == 0 and y_pred == 1:

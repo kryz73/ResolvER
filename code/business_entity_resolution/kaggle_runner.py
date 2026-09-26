@@ -66,6 +66,7 @@ def main():
     parser.add_argument("--sample-size", type=int, default=None, help="Train sample size (default: None for full Kaggle dataset)")
     parser.add_argument("--use-dense", action="store_true", help="Enable dense multilingual embedding blocking")
     parser.add_argument("--skip-test", action="store_true", help="Skip test set inference (useful for fast cross-validation diagnostics)")
+    parser.add_argument("--test-sample-size", type=int, default=None, help="Sample size for test set inference verification")
     parser.add_argument("--team-name", type=str, default="tea_ml", help="Your team name for official submission zip")
     args = parser.parse_args()
 
@@ -106,9 +107,10 @@ def main():
         print(f"\n[Step 3/5] Launching Approach 4 Pipeline on {device} (Train Sample: {sample_desc}, Test Inference: {test_desc})...")
 
         run_pipeline(
-            train_sample_size=args.sample_size,  # Full dataset or custom sample
-            test_mode=not args.skip_test,        # Generate test candidate_pairs.tsv and matching_results.tsv
-            use_dense=args.use_dense,            # Dense FAISS vector blocking flag
+            train_sample_size=args.sample_size,      # Full dataset or custom sample
+            test_mode=not args.skip_test,            # Generate test candidate_pairs.tsv and matching_results.tsv
+            test_sample_size=args.test_sample_size,  # Test sample for verification
+            use_dense=args.use_dense,                # Dense FAISS vector blocking flag
             device=device,
             log_dir=log_dir,
             experiment_name="kaggle_run"

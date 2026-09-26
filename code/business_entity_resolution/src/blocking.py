@@ -56,14 +56,12 @@ class LexicalBlocker:
         self.token_index = defaultdict(list)
         self.postal_index = defaultdict(list)
         self.locality_index = defaultdict(list)
-        self.target_records = {}
 
     def fit(self, target_df: pd.DataFrame):
         """Builds multi-tier inverted indexes on target records (Sources 2 and 3)."""
         self.token_index.clear()
         self.postal_index.clear()
         self.locality_index.clear()
-        self.target_records.clear()
 
         eids = target_df['entity_id'].tolist()
         norm_names = target_df['norm_name'].tolist()
@@ -75,7 +73,6 @@ class LexicalBlocker:
             iterator = tqdm(iterator, total=len(eids), desc=f"  [Blocking] Indexing Targets ({len(eids):,})", mininterval=0.5)
 
         for eid, norm_name, norm_addr, postal in iterator:
-            self.target_records[eid] = norm_name
 
             # 1. Significant brand tokens (including guarded 2-letter brands)
             words = extract_brand_tokens(norm_name)
@@ -237,24 +234,44 @@ class DenseBlocker:
         return results
 
 
-def run_hybrid_blocking(
-    s1_df: pd.DataFrame,
+def fit_hybrid_blocker(
     s23_df: pd.DataFrame,
     max_candidates_per_entity: int = MAX_CANDIDATES_PER_ENTITY,
     dense_model_name: Optional[str] = None
-) -> Dict[str, Set[str]]:
+) -> Tuple[LexicalBlocker, Optional[DenseBlocker]]:
     """
-    Executes hybrid blocking (Sparse BM25 + Dense FAISS) for a single country partition.
-    Returns: mapping {source1_entity_id: set(candidate_target_ids)}
+    Fits sparse and optional dense blockers on target records (Sources 2 and 3).
+    Returns: (lex_blocker, dense_blocker)
     """
     print(f"  [Blocking] Building sparse lexical index over {len(s23_df):,} target records...")
     lex_blocker = LexicalBlocker(max_candidates_per_entity=max_candidates_per_entity)
     lex_blocker.fit(s23_df)
 
+    dense_blocker = None
+    if dense_model_name and faiss is not None:
+        try:
+            print(f"  [Blocking] Building dense vector index with {dense_model_name}...")
+            dense_blocker = DenseBlocker(model_name=dense_model_name, similarity_cutoff=0.62, max_candidates=20)
+            dense_blocker.fit(s23_df)
+        except Exception as e:
+            print(f"  [Blocking Warning] Dense blocker init skipped due to: {e}")
+            dense_blocker = None
+
+    return lex_blocker, dense_blocker
+
+
+def query_hybrid_blocker(
+    s1_df: pd.DataFrame,
+    lex_blocker: LexicalBlocker,
+    dense_blocker: Optional[DenseBlocker] = None,
+    max_candidates_per_entity: int = MAX_CANDIDATES_PER_ENTITY
+) -> Dict[str, Set[str]]:
+    """
+    Queries fitted blockers for a batch of S1 reference entities.
+    Returns: mapping {source1_entity_id: set(candidate_target_ids)}
+    """
     candidates_per_s1: Dict[str, Set[str]] = defaultdict(set)
 
-    # 1. Sparse Pass
-    print(f"  [Blocking] Querying sparse index for {len(s1_df):,} reference entities...")
     s1_ids = s1_df['entity_id'].tolist()
     norm_names = s1_df['norm_name'].tolist()
     norm_addrs = s1_df['norm_address'].tolist()
@@ -269,30 +286,20 @@ def run_hybrid_blocking(
         for tid, _ in hits:
             candidates_per_s1[s1_id].add(tid)
 
-
-
-    # 2. Dense Pass (if model specified and available)
-    if dense_model_name and faiss is not None:
+    if dense_blocker is not None and dense_blocker.index is not None:
         try:
-            print(f"  [Blocking] Building dense vector index with {dense_model_name}...")
-            dense_blocker = DenseBlocker(model_name=dense_model_name, similarity_cutoff=0.62, max_candidates=20)
-            dense_blocker.fit(s23_df)
-
-            print(f"  [Blocking] Querying dense vector index...")
             q_texts = (s1_df['norm_name'] + " " + s1_df['norm_address']).tolist()
             dense_hits = dense_blocker.retrieve_candidates(q_texts)
-
-            s1_ids = s1_df['entity_id'].tolist()
             for q_idx, hits in dense_hits.items():
                 s1_id = s1_ids[q_idx]
                 for tid, _ in hits:
                     candidates_per_s1[s1_id].add(tid)
         except Exception as e:
-            print(f"  [Blocking Warning] Dense blocking skipped due to: {e}")
+            print(f"  [Blocking Warning] Dense query skipped due to: {e}")
 
     # Enforce candidate ceiling per S1 entity
     final_candidates = {}
-    for s1_id in s1_df['entity_id']:
+    for s1_id in s1_ids:
         c_set = candidates_per_s1.get(s1_id, set())
         if len(c_set) > max_candidates_per_entity:
             final_candidates[s1_id] = set(list(c_set)[:max_candidates_per_entity])
@@ -300,6 +307,29 @@ def run_hybrid_blocking(
             final_candidates[s1_id] = c_set
 
     return final_candidates
+
+
+def run_hybrid_blocking(
+    s1_df: pd.DataFrame,
+    s23_df: pd.DataFrame,
+    max_candidates_per_entity: int = MAX_CANDIDATES_PER_ENTITY,
+    dense_model_name: Optional[str] = None
+) -> Dict[str, Set[str]]:
+    """
+    Executes hybrid blocking (Sparse BM25 + Dense FAISS) for a single country partition.
+    Convenience wrapper around fit_hybrid_blocker and query_hybrid_blocker.
+    """
+    lex_blocker, dense_blocker = fit_hybrid_blocker(
+        s23_df,
+        max_candidates_per_entity=max_candidates_per_entity,
+        dense_model_name=dense_model_name
+    )
+    return query_hybrid_blocker(
+        s1_df,
+        lex_blocker,
+        dense_blocker=dense_blocker,
+        max_candidates_per_entity=max_candidates_per_entity
+    )
 
 
 def write_candidate_pairs_tsv(
