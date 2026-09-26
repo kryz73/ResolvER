@@ -339,28 +339,94 @@ class DenseBlocker:
         )
         return np.ascontiguousarray(emb, dtype=np.float32)
 
-    def fit(self, target_df: pd.DataFrame, batch_size: int = 256):
-        """Encodes target records and builds FAISS index."""
-        if faiss is None:
+    def fit(self, target_df: pd.DataFrame, batch_size: int = 256, chunk_size: int = 100_000):
+        """
+        Encodes target records in memory-safe chunks and builds FAISS index.
+        Prevents IPC memory duplication and Linux OOM kills on massive datasets.
+        """
+        if faiss is None or target_df is None or len(target_df) == 0:
             return
 
-        texts = (target_df['norm_name'] + " " + target_df['norm_address']).tolist()
+        self._init_model()
         self.target_ids = target_df['entity_id'].tolist()
+        n_targets = len(target_df)
 
-        embeddings = self.encode(texts, batch_size=batch_size)
-        dim = embeddings.shape[1]
-
-        # Use IndexFlatIP for normalized cosine similarity
+        dim = self.model.get_sentence_embedding_dimension() if hasattr(self.model, "get_sentence_embedding_dimension") else 1024
         self.index = faiss.IndexFlatIP(dim)
-        self.index.add(embeddings)
+
+        # Multi-GPU pool initialization if multiple GPUs exist
+        pool = None
+        try:
+            import torch
+            if torch.cuda.is_available() and torch.cuda.device_count() > 1 and n_targets >= 10000:
+                target_devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+                print(f"  [Multi-GPU Dense Blocking] Starting parallel worker pool across {len(target_devices)} GPUs: {target_devices}...")
+                pool = self.model.start_multi_process_pool(target_devices=target_devices)
+        except Exception as e:
+            print(f"  [Multi-GPU Note] Worker pool fallback to single device ({e})")
+            pool = None
+
+        n_chunks = int(np.ceil(n_targets / chunk_size))
+        print(f"  [Dense Blocker] Indexing {n_targets:,} targets in {n_chunks} chunk(s) of {chunk_size:,}...")
+
+        import gc
+        for c_idx in range(n_chunks):
+            start_i = c_idx * chunk_size
+            end_i = min(start_i + chunk_size, n_targets)
+            chunk_slice = target_df.iloc[start_i:end_i]
+            chunk_texts = (chunk_slice['norm_name'] + " " + chunk_slice['norm_address']).tolist()
+            del chunk_slice
+
+            if pool is not None:
+                try:
+                    chunk_embs = self.model.encode_multi_process(
+                        chunk_texts,
+                        pool,
+                        batch_size=batch_size,
+                        normalize_embeddings=True
+                    )
+                except Exception as e:
+                    print(f"  [Multi-GPU Pool Warning] Chunk {c_idx+1} fallback ({e}).")
+                    chunk_embs = self.model.encode(
+                        chunk_texts,
+                        batch_size=batch_size,
+                        show_progress_bar=False,
+                        normalize_embeddings=True,
+                        device=self.device
+                    )
+            else:
+                chunk_embs = self.model.encode(
+                    chunk_texts,
+                    batch_size=batch_size,
+                    show_progress_bar=False,
+                    normalize_embeddings=True,
+                    device=self.device
+                )
+            del chunk_texts
+
+            chunk_arr = np.ascontiguousarray(chunk_embs, dtype=np.float32)
+            del chunk_embs
+            self.index.add(chunk_arr)
+            del chunk_arr
+            gc.collect()
+
+        if pool is not None:
+            try:
+                self.model.stop_multi_process_pool(pool)
+            except Exception:
+                pass
+            del pool
+            gc.collect()
 
     def retrieve_candidates(self, query_texts: List[str], batch_size: int = 256) -> Dict[int, List[Tuple[str, float]]]:
         """Performs batch vector query and returns candidates with their raw cosine similarity scores."""
-        if self.index is None or faiss is None:
+        if self.index is None or faiss is None or not query_texts:
             return {}
 
         q_embs = self.encode(query_texts, batch_size=batch_size)
         sims, indices = self.index.search(q_embs, self.max_candidates)
+        del q_embs
+        import gc; gc.collect()
 
         results = {}
         for q_idx in range(len(query_texts)):
@@ -372,6 +438,8 @@ class DenseBlocker:
                     q_res.append((self.target_ids[t_idx], score))
             results[q_idx] = q_res
 
+        del sims, indices
+        gc.collect()
         return results
 
 

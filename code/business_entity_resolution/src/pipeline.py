@@ -487,8 +487,10 @@ def run_pipeline(
                 dense_model_name=dense_model
             )
 
-            # Build target lookup dict once for feature extraction across batches
-            target_lookup = shard_s23_proc.set_index('entity_id').to_dict('index')
+            # Index target DataFrame by entity_id for fast on-demand batch lookup (eliminates 8.5GB dictionary overhead)
+            shard_s23_indexed = shard_s23_proc.set_index('entity_id')
+            del shard_s23_proc
+            gc.collect()
 
             # ── 6e. Process S1 Entities in Memory-Bounded Batches ──
             s1_batch_size = 50_000
@@ -522,16 +524,21 @@ def run_pipeline(
                             f.write(f"{s1_id}\t\n")
                         written_s1_ids.add(s1_id)
 
+                # Build lookup dict ONLY for targets retrieved in this batch (< 50MB instead of 8.5GB)
+                needed_tids = list({tid for cset in batch_candidates.values() for tid in cset if tid in shard_s23_indexed.index})
+                batch_target_lookup = shard_s23_indexed.loc[needed_tids].to_dict('index')
+
                 # Extract features + score in 250K chunks with candidate provenance
                 batch_pairs = [(sid, tid) for sid, cset in batch_candidates.items() for tid in cset]
                 batch_s1_lookup = batch_s1_df.set_index('entity_id').to_dict('index')
                 batch_s1_freqs = batch_s1_df['norm_name'].value_counts().to_dict()
 
                 scored_triples = extract_features_and_score_chunked(
-                    batch_pairs, batch_s1_lookup, target_lookup, batch_s1_freqs,
+                    batch_pairs, batch_s1_lookup, batch_target_lookup, batch_s1_freqs,
                     matcher, chunk_size=250_000,
                     provenance_map=batch_prov
                 )
+                del batch_target_lookup
 
                 # Optional Selective Cross-Encoder Reranking on the ambiguous probability tail
                 if reranker is not None and reranker.model is not None:
@@ -594,7 +601,7 @@ def run_pipeline(
                 del entity_preds
                 gc.collect()
 
-            del lex_blocker, dense_blocker, target_lookup, shard_s1_proc, shard_s23_proc
+            del lex_blocker, dense_blocker, shard_s1_proc, shard_s23_indexed
             gc.collect()
             tracker.log(f"  [{country}] All batches complete. Memory released.")
 
