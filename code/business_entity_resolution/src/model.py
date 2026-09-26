@@ -119,7 +119,7 @@ class SelectiveCrossEncoderReranker:
     selectively on the ambiguous tail (e.g. 0.35 <= prob <= 0.75 or top-K).
     Accelerated with CUDA and FP16 when GPU is present (e.g. Kaggle T4 GPU).
     """
-    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", top_k: int = 10, batch_size: int = 64):
+    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", top_k: int = 1, batch_size: int = 128):
         self.model_name = model_name
         self.top_k = top_k
         self.batch_size = batch_size
@@ -135,6 +135,11 @@ class SelectiveCrossEncoderReranker:
             try:
                 from sentence_transformers import CrossEncoder
                 self.model = CrossEncoder(self.model_name, max_length=256, device=self.device)
+                if self.device == "cuda" and hasattr(self.model, "model"):
+                    try:
+                        self.model.model = self.model.model.half()
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"  [Reranker Note] CrossEncoder init skipped or unavailable ({e}).")
                 self.model = None

@@ -172,9 +172,9 @@ BATCH_SIZE = 128
 # Multilingual Cross-Encoder Reranker (BGE-Reranker-v2-m3: 560M params, Apache 2.0 License)
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 ENABLE_RERANKER = False
-RERANK_TOP_K = 10
-RERANK_AMBIGUOUS_MIN = 0.35
-RERANK_AMBIGUOUS_MAX = 0.75
+RERANK_TOP_K = 1
+RERANK_AMBIGUOUS_MIN = 0.46
+RERANK_AMBIGUOUS_MAX = 0.56
 
 # Reciprocal Rank Fusion (RRF) Parameters
 RRF_K = 20  # Constant factor smoothing ranks

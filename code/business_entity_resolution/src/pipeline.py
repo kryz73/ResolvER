@@ -24,7 +24,7 @@ from config import (
     DEFAULT_MATCH_THRESHOLD, SINGLETON_THRESHOLD,
     MAX_MATCHES_PER_ENTITY, MAX_CANDIDATES_PER_ENTITY,
     SBERT_MODEL_NAME, RERANKER_MODEL_NAME,
-    RERANK_AMBIGUOUS_MIN, RERANK_AMBIGUOUS_MAX
+    RERANK_TOP_K, RERANK_AMBIGUOUS_MIN, RERANK_AMBIGUOUS_MAX
 )
 from preprocessing import preprocess_dataframe
 from blocking import (
@@ -535,10 +535,17 @@ def run_pipeline(
 
                 # Optional Selective Cross-Encoder Reranking on the ambiguous probability tail
                 if reranker is not None and reranker.model is not None:
-                    ambiguous_indices = [
-                        i for i, (_, _, p) in enumerate(scored_triples)
-                        if RERANK_AMBIGUOUS_MIN <= p <= RERANK_AMBIGUOUS_MAX
-                    ]
+                    # Group ambiguous pairs by s1 entity and take at most RERANK_TOP_K
+                    s1_ambiguous = defaultdict(list)
+                    for i, (sid, tid, p) in enumerate(scored_triples):
+                        if RERANK_AMBIGUOUS_MIN <= p <= RERANK_AMBIGUOUS_MAX:
+                            s1_ambiguous[sid].append((i, p))
+
+                    ambiguous_indices = []
+                    for sid, cand_list in s1_ambiguous.items():
+                        cand_list.sort(key=lambda x: x[1], reverse=True)
+                        for item in cand_list[:RERANK_TOP_K]:
+                            ambiguous_indices.append(item[0])
                     if ambiguous_indices:
                         pairs_to_rerank = [
                             (
