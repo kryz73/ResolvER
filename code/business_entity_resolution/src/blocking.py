@@ -300,9 +300,35 @@ class DenseBlocker:
                 # Fallback to MiniLM if BGE-M3 is unavailable
                 fallback_name = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
                 self.model = SentenceTransformer(fallback_name, device=self.device)
+            if self.device == "cuda":
+                try:
+                    self.model = self.model.half()
+                except Exception:
+                    pass
 
-    def encode(self, texts: List[str], batch_size: int = 128) -> np.ndarray:
+    def encode(self, texts: List[str], batch_size: int = 256) -> np.ndarray:
         self._init_model()
+        if not texts:
+            return np.empty((0, 384), dtype=np.float32)
+
+        # Multi-GPU parallelization if multiple GPUs exist (e.g. Kaggle dual T4)
+        try:
+            import torch
+            if torch.cuda.is_available() and torch.cuda.device_count() > 1 and len(texts) >= 5000:
+                target_devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+                print(f"  [Multi-GPU Dense Blocking] Parallelizing encoding across {len(target_devices)} GPUs: {target_devices}...")
+                pool = self.model.start_multi_process_pool(target_devices=target_devices)
+                emb = self.model.encode_multi_process(
+                    texts,
+                    pool,
+                    batch_size=batch_size,
+                    normalize_embeddings=True
+                )
+                self.model.stop_multi_process_pool(pool)
+                return np.ascontiguousarray(emb, dtype=np.float32)
+        except Exception as e:
+            print(f"  [Multi-GPU Note] Multi-process pool fallback to single device ({e})")
+
         show_prog = len(texts) >= 50000
         emb = self.model.encode(
             texts,
@@ -313,7 +339,7 @@ class DenseBlocker:
         )
         return np.ascontiguousarray(emb, dtype=np.float32)
 
-    def fit(self, target_df: pd.DataFrame, batch_size: int = 128):
+    def fit(self, target_df: pd.DataFrame, batch_size: int = 256):
         """Encodes target records and builds FAISS index."""
         if faiss is None:
             return
@@ -328,7 +354,7 @@ class DenseBlocker:
         self.index = faiss.IndexFlatIP(dim)
         self.index.add(embeddings)
 
-    def retrieve_candidates(self, query_texts: List[str], batch_size: int = 128) -> Dict[int, List[Tuple[str, float]]]:
+    def retrieve_candidates(self, query_texts: List[str], batch_size: int = 256) -> Dict[int, List[Tuple[str, float]]]:
         """Performs batch vector query and returns candidates with their raw cosine similarity scores."""
         if self.index is None or faiss is None:
             return {}

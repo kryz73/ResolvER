@@ -63,9 +63,16 @@ def main():
     parser = argparse.ArgumentParser(description="Kaggle Runner for Business Entity Resolution")
     parser.add_argument("--mode", type=str, default="standard", choices=["standard", "loco_check"],
                         help="Execution mode: 'standard' or 'loco_check' (Leave-One-Country-Out France proxy)")
-    parser.add_argument("--sample-size", type=int, default=None, help="Train sample size (default: None for full Kaggle dataset)")
+    parser.add_argument("--sample-size", type=str, default=None,
+                        help="Train sample size (int like 220000, or float like 0.1 for 10% of dataset)")
     parser.add_argument("--use-dense", action="store_true", help="Enable dense multilingual embedding blocking")
+    parser.add_argument("--dense-model", type=str, default="BAAI/bge-m3",
+                        help="HuggingFace model for dense blocking (default: 'BAAI/bge-m3', fast alternative: 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')")
     parser.add_argument("--skip-test", action="store_true", help="Skip test set inference (useful for fast cross-validation diagnostics)")
+    parser.add_argument("--test-only", action="store_true", help="Skip training and run inference using existing saved model checkpoint")
+    parser.add_argument("--model-checkpoint", type=str, default=None, help="Path to saved model checkpoint (.pkl)")
+    parser.add_argument("--tau", type=float, default=None, help="Classification decision threshold (default: auto-loaded from run_summary.json or 0.39)")
+    parser.add_argument("--tau-singleton", type=float, default=None, help="Singleton guardrail threshold (default: auto-loaded from run_summary.json or 0.25)")
     parser.add_argument("--test-sample-size", type=int, default=None, help="Sample size for test set inference verification")
     parser.add_argument("--use-reranker", action="store_true", help="Enable multilingual cross-encoder reranking on hard ambiguous tail (T4 GPU recommended)")
     parser.add_argument("--team-name", type=str, default="tea_ml", help="Your team name for official submission zip")
@@ -84,46 +91,78 @@ def main():
     try:
         import torch
         has_gpu = torch.cuda.is_available()
-        gpu_name = torch.cuda.get_device_name(0) if has_gpu else "None (CPU Mode)"
+        n_gpus = torch.cuda.device_count() if has_gpu else 0
+        if has_gpu:
+            gpu_names = [f"GPU {i}: {torch.cuda.get_device_name(i)}" for i in range(n_gpus)]
+            gpu_desc = " | ".join(gpu_names)
+        else:
+            gpu_desc = "None (CPU Mode)"
     except ImportError:
         has_gpu = False
-        gpu_name = "None (PyTorch not found)"
+        n_gpus = 0
+        gpu_desc = "None (PyTorch not found)"
 
     device = "cuda" if has_gpu else "cpu"
     if has_gpu:
         os.environ["USE_GPU"] = "1"
-    print(f"  Compute Device: {device} ({gpu_name})")
+    print(f"  Compute Device: {device} ({n_gpus} GPU(s) detected: {gpu_desc})")
 
     log_dir = "/kaggle/working/logs" if Path("/kaggle/working").exists() else "logs"
+
+    # Parse sample size (handles int like 220000 or float like 0.1 for 10%)
+    sample_val = None
+    if args.sample_size is not None:
+        try:
+            if "." in str(args.sample_size):
+                sample_val = float(args.sample_size)
+            else:
+                sample_val = int(args.sample_size)
+        except ValueError:
+            sample_val = None
 
     if args.mode == "loco_check":
         print(f"\n[Step 3/5] Launching Leave-One-Country-Out (LOCO) Proxy Evaluation on {device}...")
         run_loco_evaluation(
-            sample_size=args.sample_size,
+            sample_size=sample_val,
             device=device,
             log_dir=log_dir,
             experiment_name="kaggle_run"
         )
     else:
-        sample_desc = f"{args.sample_size:,}" if args.sample_size else "FULL DATASET"
+        if isinstance(sample_val, float):
+            sample_desc = f"{sample_val*100:.1f}% OF DATASET"
+        elif isinstance(sample_val, int):
+            sample_desc = f"{sample_val:,}"
+        else:
+            sample_desc = "FULL DATASET"
         test_desc = "SKIPPED (Evaluation Mode Only)" if args.skip_test else "ENABLED (Generating Submission)"
         print(f"\n[Step 3/5] Launching Approach 4 Pipeline on {device} (Train Sample: {sample_desc}, Test Inference: {test_desc})...")
 
         run_pipeline(
-            train_sample_size=args.sample_size,      # Full dataset or custom sample
+            train_sample_size=sample_val,            # Full dataset or custom sample
             test_mode=not args.skip_test,            # Generate test candidate_pairs.tsv and matching_results.tsv
             test_sample_size=args.test_sample_size,  # Test sample for verification
             use_dense=args.use_dense,                # Dense FAISS vector blocking flag
+            dense_model_name=args.dense_model,       # Model for dense embeddings
             use_reranker=args.use_reranker,          # Selective cross-encoder reranker flag
+            test_only=args.test_only,                # Skip training and run inference using existing saved checkpoint
+            model_checkpoint_path=args.model_checkpoint,
+            optimal_tau=args.tau,
+            optimal_singleton_tau=args.tau_singleton,
             device=device,
             log_dir=log_dir,
             experiment_name="kaggle_run"
         )
 
 
-    # 4. Display Diagnostic Results in Kaggle
+    # 4. Display Diagnostic Results in Kaggle / Colab
     print("\n[Step 4/5] Pipeline Execution Summary & Diagnostics:")
-    log_base = Path("/kaggle/working/logs/kaggle_run") if Path("/kaggle/working").exists() else Path("logs/kaggle_run")
+    if Path("/kaggle/working").exists():
+        log_base = Path("/kaggle/working/logs/kaggle_run")
+    elif Path("/content").exists():
+        log_base = Path("/content/logs/kaggle_run")
+    else:
+        log_base = Path("logs/kaggle_run")
 
     summary_file = log_base / "run_summary.json"
     if summary_file.exists():
@@ -147,7 +186,7 @@ def main():
     # 5. Packaging Submission Files According to Guidelines
     if not args.skip_test and (OUTPUT_MATCHING_PATH.exists() or OUTPUT_CANDIDATE_PATH.exists()):
         print("\n[Step 5/5] Packaging Submission Files According to Guidelines...")
-        working_dir = Path("/kaggle/working") if Path("/kaggle/working").exists() else OUTPUT_DIR
+        working_dir = Path("/kaggle/working") if Path("/kaggle/working").exists() else (Path("/content") if Path("/content").exists() else OUTPUT_DIR)
         working_dir.mkdir(parents=True, exist_ok=True)
 
         team_slug = args.team_name.strip().replace(" ", "_")

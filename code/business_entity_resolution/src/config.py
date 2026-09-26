@@ -23,6 +23,12 @@ def detect_dataset_root() -> Path:
         for p in kaggle_input.rglob("train_source1.tsv"):
             return p.parent.parent  # parent is 'train', grandparent is 'dataset'
 
+    # Google Colab detection: check local /content (fast SSD) and /content/drive
+    colab_dir = Path("/content")
+    if colab_dir.exists():
+        for p in colab_dir.rglob("train_source1.tsv"):
+            return p.parent.parent
+
     local_path = Path("/home/kryz/dev/amazon/6ab10eb3b23ba_student_resource/student_resource/dataset")
     if local_path.exists():
         return local_path
@@ -36,24 +42,31 @@ def detect_dataset_root() -> Path:
 
 
 def detect_output_dir() -> Path:
-    """Auto-detects output directory: /kaggle/working/output on Kaggle, or ./output locally."""
+    """Auto-detects output directory: /kaggle/working/output on Kaggle, /content/output on Colab, or ./output locally."""
     if "OUTPUT_DIR" in os.environ:
         return Path(os.environ["OUTPUT_DIR"])
     if Path("/kaggle/working").exists():
         return Path("/kaggle/working/output")
+    if Path("/content").exists():
+        return Path("/content/output")
     if Path("/home/kryz/dev/amazon").exists():
         return Path("/home/kryz/dev/amazon/output")
     return Path("./output")
 
 
 def detect_validate_script() -> Path:
-    """Finds the validate_submission.py script across environments."""
+    """Finds the validate_submission.py script across environments (Kaggle / Colab / Local)."""
     if "VALIDATE_SCRIPT" in os.environ and Path(os.environ["VALIDATE_SCRIPT"]).exists():
         return Path(os.environ["VALIDATE_SCRIPT"])
 
     kaggle_input = Path("/kaggle/input")
     if kaggle_input.exists():
         for p in kaggle_input.rglob("validate_submission.py"):
+            return p
+
+    colab_dir = Path("/content")
+    if colab_dir.exists():
+        for p in colab_dir.rglob("validate_submission.py"):
             return p
 
     local_script = Path("/home/kryz/dev/amazon/6ab10eb3b23ba_student_resource/student_resource/utils/validate_submission.py")
@@ -68,11 +81,21 @@ def detect_validate_script() -> Path:
 
 
 def find_file(filename: str, fallback_path: Path) -> Path:
-    """Finds a file recursively in DATASET_ROOT, /kaggle/input, or local directories."""
+    """Finds a file recursively in DATASET_ROOT, /kaggle/input, /content, or local directories."""
     if fallback_path.exists():
         return fallback_path
     if "DATASET_ROOT" in os.environ:
         root = Path(os.environ["DATASET_ROOT"])
+        for p in root.rglob(filename):
+            return p
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.exists():
+        for p in kaggle_input.rglob(filename):
+            return p
+    colab_dir = Path("/content")
+    if colab_dir.exists():
+        for p in colab_dir.rglob(filename):
+            return p
         if (root / filename).exists():
             return root / filename
         for p in root.rglob(filename):

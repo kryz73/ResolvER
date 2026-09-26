@@ -23,8 +23,8 @@ Copy and paste the following cells into your Kaggle Notebook:
 
 ### Cell 1: Clone Project Repository & Install Packages
 ```python
-# 1. Install high-speed dependencies & neural model libraries (if using T4 GPU)
-!pip install -q rapidfuzz indic-transliteration lightgbm sentence-transformers
+# 1. Install high-speed dependencies
+!pip install -q rapidfuzz indic-transliteration lightgbm
 
 # 2. Clone your GitHub repository into /kaggle/working
 import os
@@ -42,20 +42,23 @@ if not Path('/kaggle/working/tea-ml').exists():
 
 ### Cell 2: Run the Pipeline on GPU
 
-You have three options:
-1. **Option A (Quick Diagnostic Check ~2 mins):** Verify that the environment, blocking, and 5-fold CV run cleanly on 5,000 entities without waiting for the full 10M test set.
-2. **Option B (Fast Competition Submission Run ~1.5 hrs):** Train on the full dataset with RRF + 38 domain features, tune thresholds, perform full test set inference on 9.97M candidates, run the official validation script, and generate `submission.zip`.
-3. **Option C (Full T4 GPU Neural Run with BGE-M3 + Reranker):** Utilize Kaggle dual T4 GPU for BGE-M3 dense semantic retrieval and selective cross-encoder reranking.
+You have several optimized options:
+1. **Option A (Recommended: 10% Dataset Full Dual-GPU Dense Run, ~2 hrs):**
+   Trains on ~220,000 entities with scaled background distractors, fully engages both T4 GPUs in parallel for dense embeddings, calibrates thresholds, runs full test inference on all 1.73M entities, and validates `submission.zip`.
+2. **Option B (Fast Test Inference via Saved Model, ~40 mins):**
+   Skips training and directly runs full test inference using an uploaded `matcher_model.pkl`.
+3. **Option C (Full Dataset Fast Lexical Run, ~1.5 hrs):**
+   Runs full dataset training using high-speed BM25/lexical blocking.
 
 ```python
-# --- OPTION A: Quick Diagnostic Run (5,000 entities, ~2 mins) ---
-# !python3 kaggle_runner.py --sample-size 5000 --skip-test
+# --- OPTION A: 10% Dataset Full Dual-GPU Dense Run (~2 hrs) ---
+!python3 kaggle_runner.py --sample-size 0.1 --use-dense
 
-# --- OPTION B: Fast Full Submission Run (LightGBM + RRF + 38 Signals) ---
-!python3 kaggle_runner.py
+# --- OPTION B: Inference Only with Saved Model Checkpoint (~40 mins) ---
+# !python3 kaggle_runner.py --test-only --use-dense --model-checkpoint /path/to/matcher_model.pkl
 
-# --- OPTION C: Neural T4 GPU Run (BGE-M3 Dense + BGE-Reranker-v2-m3) ---
-# !python3 kaggle_runner.py --use-dense --use-reranker
+# --- OPTION C: Full Dataset Fast Lexical Run (~1.5 hrs) ---
+# !python3 kaggle_runner.py
 ```
 
 ---
