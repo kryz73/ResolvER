@@ -23,7 +23,8 @@ from config import (
     VALIDATE_SCRIPT, TEST_DIR, ARTIFACT_DIR,
     DEFAULT_MATCH_THRESHOLD, SINGLETON_THRESHOLD,
     MAX_MATCHES_PER_ENTITY, MAX_CANDIDATES_PER_ENTITY,
-    SBERT_MODEL_NAME
+    SBERT_MODEL_NAME, RERANKER_MODEL_NAME,
+    RERANK_AMBIGUOUS_MIN, RERANK_AMBIGUOUS_MAX
 )
 from preprocessing import preprocess_dataframe
 from blocking import (
@@ -31,7 +32,7 @@ from blocking import (
     fit_hybrid_blocker, query_hybrid_blocker
 )
 from features import build_feature_matrix
-from model import AsymmetricEntityMatcher, train_5fold_cv
+from model import AsymmetricEntityMatcher, train_5fold_cv, SelectiveCrossEncoderReranker
 from postprocessing import (
     evaluate_macro_f05, tune_decision_thresholds,
     apply_decision_rules, write_matching_results_tsv
@@ -54,6 +55,8 @@ def run_pipeline(
     test_sample_size: Optional[int] = None,
     use_dense: bool = False,
     dense_model_name: str = SBERT_MODEL_NAME,
+    use_reranker: bool = False,
+    reranker_model_name: Optional[str] = None,
     device: str = "cpu",
     log_dir: str = "logs",
     experiment_name: Optional[str] = None
@@ -163,20 +166,23 @@ def run_pipeline(
     # PHASE 2: COUNTRY-PARTITIONED DUAL BLOCKING
     # ──────────────────────────────────────────────────────────────────────────
     tracker.start_timer("blocking")
-    tracker.log("Phase 2: Generating Candidate Pairs via Country-Partitioned Inverted Indexing...")
+    tracker.log("Phase 2: Generating Candidate Pairs via Country-Partitioned Inverted Indexing & RRF Fusion...")
     all_candidates: Dict[str, Set[str]] = {}
+    train_provenance: Dict[Tuple[str, str], Dict[str, float]] = {}
     dense_model = dense_model_name if use_dense else None
 
     for country in sorted(s1_train_proc['country'].unique()):
         s1_c = s1_train_proc[s1_train_proc['country'] == country]
         s23_c = s23_train_proc[s23_train_proc['country'] == country]
         tracker.log(f"  Blocking country [{country}]: {len(s1_c):,} S1 against {len(s23_c):,} targets...")
-        c_dict = run_hybrid_blocking(
+        c_dict, prov_dict = run_hybrid_blocking(
             s1_c, s23_c,
             max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY,
-            dense_model_name=dense_model
+            dense_model_name=dense_model,
+            return_provenance=True
         )
         all_candidates.update(c_dict)
+        train_provenance.update(prov_dict)
 
     # Evaluate Blocking Performance (Pair Completeness & Reduction Ratio)
     total_true_matches = sum(len(gt_train.get(sid, set())) for sid in s1_train_ids)
@@ -248,7 +254,11 @@ def run_pipeline(
             pair_s1_ids.append(s1_id)
 
     labels = np.array(labels, dtype=np.int32)
-    X, feat_names = build_feature_matrix(pair_list, s1_train_proc, s23_train_proc)
+    X, feat_names = build_feature_matrix(
+        pair_list, s1_train_proc, s23_train_proc,
+        provenance_map=train_provenance
+    )
+    del train_provenance
     tracker.log(f"Feature matrix built: {X.shape[0]:,} candidate rows x {X.shape[1]} features.")
     tracker.stop_timer("feature_extraction")
 
@@ -322,6 +332,12 @@ def run_pipeline(
 
         import gc
         from features import extract_features_and_score_chunked
+
+        reranker = None
+        if use_reranker:
+            r_name = reranker_model_name or RERANKER_MODEL_NAME
+            tracker.log(f"Initializing Multilingual Cross-Encoder Reranker ({r_name})...")
+            reranker = SelectiveCrossEncoderReranker(model_name=r_name)
 
         test_s1_full = pd.read_csv(TEST_S1_PATH, sep="\t")
         test_s1_ids = test_s1_full['entity_id'].tolist()
@@ -413,10 +429,11 @@ def run_pipeline(
                 batch_s1_df = shard_s1_proc.iloc[b_start:b_end]
                 batch_s1_ids = batch_s1_df['entity_id'].tolist()
 
-                # Query blocker for this batch only
-                batch_candidates = query_hybrid_blocker(
+                # Query blocker for this batch with multi-channel RRF and provenance
+                batch_candidates, batch_prov = query_hybrid_blocker(
                     batch_s1_df, lex_blocker, dense_blocker=dense_blocker,
-                    max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY
+                    max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY,
+                    return_provenance=True
                 )
 
                 # Write candidate_pairs.tsv (append mode)
@@ -433,16 +450,40 @@ def run_pipeline(
                             f.write(f"{s1_id}\t\n")
                         written_s1_ids.add(s1_id)
 
-                # Extract features + score in 250K chunks
+                # Extract features + score in 250K chunks with candidate provenance
                 batch_pairs = [(sid, tid) for sid, cset in batch_candidates.items() for tid in cset]
                 batch_s1_lookup = batch_s1_df.set_index('entity_id').to_dict('index')
                 batch_s1_freqs = batch_s1_df['norm_name'].value_counts().to_dict()
 
                 scored_triples = extract_features_and_score_chunked(
                     batch_pairs, batch_s1_lookup, target_lookup, batch_s1_freqs,
-                    matcher, chunk_size=250_000
+                    matcher, chunk_size=250_000,
+                    provenance_map=batch_prov
                 )
-                del batch_s1_lookup, batch_s1_freqs, batch_pairs, batch_candidates
+
+                # Optional Selective Cross-Encoder Reranking on the ambiguous probability tail
+                if reranker is not None and reranker.model is not None:
+                    ambiguous_indices = [
+                        i for i, (_, _, p) in enumerate(scored_triples)
+                        if RERANK_AMBIGUOUS_MIN <= p <= RERANK_AMBIGUOUS_MAX
+                    ]
+                    if ambiguous_indices:
+                        pairs_to_rerank = [
+                            (
+                                f"{batch_s1_lookup.get(scored_triples[i][0], {}).get('norm_name', '')} {batch_s1_lookup.get(scored_triples[i][0], {}).get('norm_address', '')}",
+                                f"{target_lookup.get(scored_triples[i][1], {}).get('norm_name', '')} {target_lookup.get(scored_triples[i][1], {}).get('norm_address', '')}"
+                            )
+                            for i in ambiguous_indices
+                        ]
+                        rerank_scores = reranker.rerank_pairs(pairs_to_rerank)
+                        updated_triples = list(scored_triples)
+                        for idx, r_score in zip(ambiguous_indices, rerank_scores):
+                            sid, tid, orig_p = updated_triples[idx]
+                            blended_p = 0.5 * orig_p + 0.5 * float(r_score)
+                            updated_triples[idx] = (sid, tid, blended_p)
+                        scored_triples = updated_triples
+
+                del batch_s1_lookup, batch_s1_freqs, batch_pairs, batch_candidates, batch_prov
                 gc.collect()
 
                 # Group scores by S1 entity and apply thresholds
@@ -644,6 +685,8 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"], help="Compute device for models (cpu or cuda)")
     parser.add_argument("--use-dense", action="store_true", help="Enable dense multilingual vector blocking (recommended on Cloud GPU)")
     parser.add_argument("--dense-model", type=str, default=SBERT_MODEL_NAME, help="HuggingFace model for dense embeddings")
+    parser.add_argument("--use-reranker", action="store_true", help="Enable multilingual cross-encoder reranking on ambiguous predictions")
+    parser.add_argument("--reranker-model", type=str, default=RERANKER_MODEL_NAME, help="HuggingFace model for cross-encoder reranking")
     parser.add_argument("--log-dir", type=str, default="logs", help="Directory to save execution logs and experiment metrics")
     parser.add_argument("--exp-name", type=str, default=None, help="Experiment name identifier")
 
@@ -663,6 +706,8 @@ if __name__ == "__main__":
             test_sample_size=args.test_sample_size,
             use_dense=args.use_dense,
             dense_model_name=args.dense_model,
+            use_reranker=args.use_reranker,
+            reranker_model_name=args.reranker_model,
             device=args.device,
             log_dir=args.log_dir,
             experiment_name=args.exp_name

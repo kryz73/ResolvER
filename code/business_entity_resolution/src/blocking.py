@@ -107,25 +107,38 @@ class LexicalBlocker:
             for aw in set(addr_words[:3]):
                 self.token_index[f"addr_{aw}"].append(eid)
 
-    def retrieve_candidates(self, query_norm_name: str, query_norm_addr: str, query_postal: str) -> List[Tuple[str, float]]:
-        """Retrieves candidate target IDs for a single S1 entity using multi-signal keys."""
-        candidate_scores = defaultdict(int)
+    def retrieve_channels(self, query_norm_name: str, query_norm_addr: str, query_postal: str) -> Dict[str, List[Tuple[str, float]]]:
+        """
+        Retrieves candidate target IDs partitioned by retrieval channel:
+        - 'word': whole brand words and 3-char prefix matches
+        - 'locality': composite locality key matches
+        - 'postal': exact postal code matches
+        - 'char3': character 3-gram matches
+        - 'street': street address token matches
+        Returns: {channel_name: [(target_id, channel_score), ...]}
+        """
+        channel_hits = {
+            'word': defaultdict(int),
+            'locality': [],
+            'postal': [],
+            'char3': defaultdict(int),
+            'street': defaultdict(int),
+        }
         words = extract_brand_tokens(query_norm_name)
         prefix3 = query_norm_name[:3] if query_norm_name else ""
 
-        # 1. Whole word matches (High Weight, capped at DF < 15,000)
+        # 1. Whole word matches & Prefix matches
         for w in set(words):
             target_ids = self.token_index.get(w, [])
             if len(target_ids) < 15000:
                 for tid in target_ids:
-                    candidate_scores[tid] += 5
+                    channel_hits['word'][tid] += 5
 
-        # Brand prefix match (First 3 characters)
         if prefix3:
             prefix_targets = self.token_index.get(f"^_{prefix3}", [])
             if len(prefix_targets) < 2500:
                 for tid in prefix_targets:
-                    candidate_scores[tid] += 3
+                    channel_hits['word'][tid] += 3
 
         # 2. Composite Locality Match (High Selectivity Key)
         city_tok = extract_locality_token(query_norm_addr)
@@ -133,10 +146,9 @@ class LexicalBlocker:
         if loc_key:
             loc_targets = self.locality_index.get(loc_key, [])
             if len(loc_targets) < 500:
-                for tid in loc_targets:
-                    candidate_scores[tid] += 6
+                channel_hits['locality'] = [(tid, 6.0) for tid in loc_targets]
 
-        # 3. Character 3-gram matches (Typos / Substring overlap, for words >= 4 chars)
+        # 3. Character 3-gram matches (for words >= 4 chars)
         tri_seen = set()
         for w in words:
             if len(w) >= 4:
@@ -147,14 +159,13 @@ class LexicalBlocker:
                         target_ids = self.token_index.get(tri, [])
                         if len(target_ids) < 2000:
                             for tid in target_ids:
-                                candidate_scores[tid] += 1
+                                channel_hits['char3'][tid] += 1
 
         # 4. Exact postal matches
         if query_postal:
             postal_targets = self.postal_index.get(query_postal, [])
             if len(postal_targets) < 500:
-                for tid in postal_targets:
-                    candidate_scores[tid] += 4
+                channel_hits['postal'] = [(tid, 4.0) for tid in postal_targets]
 
         # 5. Street name matches from address
         if query_norm_addr:
@@ -163,40 +174,146 @@ class LexicalBlocker:
                 target_ids = self.token_index.get(f"addr_{aw}", [])
                 if len(target_ids) < 1500:
                     for tid in target_ids:
-                        candidate_scores[tid] += 2
+                        channel_hits['street'][tid] += 2
 
-        if not candidate_scores:
-            return []
+        # Convert dict accumulators to sorted ranking lists
+        results = {}
+        if channel_hits['word']:
+            results['word'] = sorted(channel_hits['word'].items(), key=lambda x: x[1], reverse=True)[:50]
+        if channel_hits['locality']:
+            results['locality'] = channel_hits['locality'][:50]
+        if channel_hits['postal']:
+            results['postal'] = channel_hits['postal'][:50]
+        if channel_hits['char3']:
+            results['char3'] = sorted(channel_hits['char3'].items(), key=lambda x: x[1], reverse=True)[:50]
+        if channel_hits['street']:
+            results['street'] = sorted(channel_hits['street'].items(), key=lambda x: x[1], reverse=True)[:50]
 
-        # Sort by candidate score and keep top-K
-        top_candidates = sorted(candidate_scores.items(), key=lambda x: x[1], reverse=True)[:self.max_candidates]
-        return top_candidates
+        return results
+
+    def retrieve_candidates(self, query_norm_name: str, query_norm_addr: str, query_postal: str) -> List[Tuple[str, float]]:
+        """Convenience method returning ranked candidates combining sparse channels."""
+        channels = self.retrieve_channels(query_norm_name, query_norm_addr, query_postal)
+        ranked_ids, _ = compute_rrf_fusion(channels, max_candidates=self.max_candidates)
+        return [(tid, 1.0) for tid in ranked_ids]
+
+
+def compute_rrf_fusion(
+    channel_rankings: Dict[str, List[Tuple[str, float]]],
+    k: int = 20,
+    weights: Optional[Dict[str, float]] = None,
+    max_candidates: int = MAX_CANDIDATES_PER_ENTITY,
+    gamma: float = 0.10,
+    min_candidates: int = 35
+) -> Tuple[List[str], Dict[str, Dict[str, float]]]:
+    """
+    Combines multi-channel ranked candidate lists using Reciprocal Rank Fusion (RRF):
+      RRF(d) = sum_{c} w_c / (k + rank_c(d))
+
+    Applies Adaptive Dynamic-K Cutoff (Relative Score Pruning):
+      Keep candidate d iff RRF(d) >= gamma * RRF(top1), bounded by [min_candidates, max_candidates].
+    """
+    default_weights = {
+        'dense': 1.5,
+        'word': 1.2,
+        'locality': 1.0,
+        'postal': 1.0,
+        'char3': 0.8,
+        'street': 0.7,
+    }
+    w_map = weights or default_weights
+
+    rrf_scores = defaultdict(float)
+    channel_membership = defaultdict(set)
+    channel_ranks = defaultdict(dict)
+    dense_sims = {}
+
+    for ch_name, candidates in channel_rankings.items():
+        w = w_map.get(ch_name, 1.0)
+        for rank, (tid, score) in enumerate(candidates, start=1):
+            rrf_scores[tid] += w / (float(k) + float(rank))
+            channel_membership[tid].add(ch_name)
+            channel_ranks[tid][ch_name] = float(rank)
+            if ch_name == 'dense':
+                dense_sims[tid] = float(score)
+
+    if not rrf_scores:
+        return [], {}
+
+    # Adaptive Dynamic-K Cutoff: Relative Score Pruning
+    sorted_all = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+    if sorted_all:
+        top_score = sorted_all[0][1]
+        threshold_score = gamma * top_score
+        pruned = [item for item in sorted_all if item[1] >= threshold_score]
+        if len(pruned) < min_candidates:
+            pruned = sorted_all[:min_candidates]
+        elif len(pruned) > max_candidates:
+            pruned = pruned[:max_candidates]
+        sorted_items = pruned
+    else:
+        sorted_items = []
+    ordered_ids = [tid for tid, _ in sorted_items]
+
+    provenance = {}
+    for tid in ordered_ids:
+        r_dict = channel_ranks.get(tid, {})
+        provenance[tid] = {
+            'rrf_score': float(rrf_scores[tid]),
+            'channel_count': float(len(channel_membership.get(tid, set()))),
+            'rank_word': float(r_dict.get('word', 999.0)),
+            'rank_locality': float(r_dict.get('locality', 999.0)),
+            'rank_postal': float(r_dict.get('postal', 999.0)),
+            'rank_char3': float(r_dict.get('char3', 999.0)),
+            'rank_dense': float(r_dict.get('dense', 999.0)),
+            'dense_cosine_sim': float(dense_sims.get(tid, 0.0)),
+            'has_dense_sim': 1.0 if tid in dense_sims else 0.0,
+        }
+
+    return ordered_ids, provenance
 
 
 
 class DenseBlocker:
     """
-    Semantic dense blocker using multilingual SBERT embeddings and FAISS index.
+    Semantic dense blocker using multilingual embeddings (BGE-M3 or SBERT) and FAISS index.
+    Accelerated with CUDA and FP16 when GPU is present (e.g. Kaggle T4 GPU).
     """
-    def __init__(self, model_name: str, similarity_cutoff: float = 0.60, max_candidates: int = 20):
+    def __init__(self, model_name: str = "BAAI/bge-m3", max_candidates: int = 30):
         self.model_name = model_name
-        self.similarity_cutoff = similarity_cutoff
         self.max_candidates = max_candidates
         self.model = None
         self.index = None
         self.target_ids = []
+        try:
+            import torch
+            self.device = "cuda" if (torch.cuda.is_available() and os.environ.get("USE_GPU", "1") == "1") else "cpu"
+        except Exception:
+            self.device = "cpu"
 
     def _init_model(self):
         if self.model is None:
             from sentence_transformers import SentenceTransformer
-            self.model = SentenceTransformer(self.model_name)
+            try:
+                self.model = SentenceTransformer(self.model_name, device=self.device)
+            except Exception:
+                # Fallback to MiniLM if BGE-M3 is unavailable
+                fallback_name = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+                self.model = SentenceTransformer(fallback_name, device=self.device)
 
-    def encode(self, texts: List[str], batch_size: int = 256) -> np.ndarray:
+    def encode(self, texts: List[str], batch_size: int = 128) -> np.ndarray:
         self._init_model()
-        emb = self.model.encode(texts, batch_size=batch_size, show_progress_bar=False, normalize_embeddings=True)
+        show_prog = len(texts) >= 50000
+        emb = self.model.encode(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=show_prog,
+            normalize_embeddings=True,
+            device=self.device
+        )
         return np.ascontiguousarray(emb, dtype=np.float32)
 
-    def fit(self, target_df: pd.DataFrame, batch_size: int = 256):
+    def fit(self, target_df: pd.DataFrame, batch_size: int = 128):
         """Encodes target records and builds FAISS index."""
         if faiss is None:
             return
@@ -211,8 +328,8 @@ class DenseBlocker:
         self.index = faiss.IndexFlatIP(dim)
         self.index.add(embeddings)
 
-    def retrieve_candidates(self, query_texts: List[str], batch_size: int = 256) -> Dict[int, List[Tuple[str, float]]]:
-        """Performs batch vector query and returns candidates exceeding similarity cutoff."""
+    def retrieve_candidates(self, query_texts: List[str], batch_size: int = 128) -> Dict[int, List[Tuple[str, float]]]:
+        """Performs batch vector query and returns candidates with their raw cosine similarity scores."""
         if self.index is None or faiss is None:
             return {}
 
@@ -223,11 +340,9 @@ class DenseBlocker:
         for q_idx in range(len(query_texts)):
             q_res = []
             for rank in range(self.max_candidates):
-                score = float(sims[q_idx, rank])
-                if score < self.similarity_cutoff:
-                    break
                 t_idx = indices[q_idx, rank]
-                if t_idx < len(self.target_ids):
+                if 0 <= t_idx < len(self.target_ids):
+                    score = float(sims[q_idx, rank])
                     q_res.append((self.target_ids[t_idx], score))
             results[q_idx] = q_res
 
@@ -251,7 +366,7 @@ def fit_hybrid_blocker(
     if dense_model_name and faiss is not None:
         try:
             print(f"  [Blocking] Building dense vector index with {dense_model_name}...")
-            dense_blocker = DenseBlocker(model_name=dense_model_name, similarity_cutoff=0.62, max_candidates=20)
+            dense_blocker = DenseBlocker(model_name=dense_model_name, max_candidates=25)
             dense_blocker.fit(s23_df)
         except Exception as e:
             print(f"  [Blocking Warning] Dense blocker init skipped due to: {e}")
@@ -264,59 +379,67 @@ def query_hybrid_blocker(
     s1_df: pd.DataFrame,
     lex_blocker: LexicalBlocker,
     dense_blocker: Optional[DenseBlocker] = None,
-    max_candidates_per_entity: int = MAX_CANDIDATES_PER_ENTITY
-) -> Dict[str, Set[str]]:
+    max_candidates_per_entity: int = MAX_CANDIDATES_PER_ENTITY,
+    return_provenance: bool = False
+):
     """
-    Queries fitted blockers for a batch of S1 reference entities.
-    Returns: mapping {source1_entity_id: set(candidate_target_ids)}
-    """
-    candidates_per_s1: Dict[str, Set[str]] = defaultdict(set)
+    Queries fitted blockers for a batch of S1 reference entities using Reciprocal Rank Fusion (RRF).
+    Eliminates arbitrary set hash truncation by ranking across all sparse and dense channels.
 
+    Returns:
+      - If return_provenance is False: mapping {source1_entity_id: set(candidate_target_ids)}
+      - If return_provenance is True: (candidates_dict, provenance_dict)
+        where provenance_dict is mapping {(s1_id, tid): provenance_info}
+    """
     s1_ids = s1_df['entity_id'].tolist()
     norm_names = s1_df['norm_name'].tolist()
     norm_addrs = s1_df['norm_address'].tolist()
     postals = s1_df['postal_code'].tolist()
 
-    iterator = zip(s1_ids, norm_names, norm_addrs, postals)
-    if len(s1_ids) >= 100:
-        iterator = tqdm(iterator, total=len(s1_ids), desc=f"  [Blocking] Querying S1 ({len(s1_ids):,})", mininterval=0.5)
-
-    for s1_id, norm_name, norm_addr, postal in iterator:
-        hits = lex_blocker.retrieve_candidates(norm_name, norm_addr, postal)
-        for tid, _ in hits:
-            candidates_per_s1[s1_id].add(tid)
-
+    # Pre-retrieve dense candidates in batch if dense blocker is present
+    dense_results = {}
     if dense_blocker is not None and dense_blocker.index is not None:
         try:
             q_texts = (s1_df['norm_name'] + " " + s1_df['norm_address']).tolist()
-            dense_hits = dense_blocker.retrieve_candidates(q_texts)
-            for q_idx, hits in dense_hits.items():
-                s1_id = s1_ids[q_idx]
-                for tid, _ in hits:
-                    candidates_per_s1[s1_id].add(tid)
+            dense_results = dense_blocker.retrieve_candidates(q_texts)
         except Exception as e:
             print(f"  [Blocking Warning] Dense query skipped due to: {e}")
+            dense_results = {}
 
-    # Enforce candidate ceiling per S1 entity
-    final_candidates = {}
-    for s1_id in s1_ids:
-        c_set = candidates_per_s1.get(s1_id, set())
-        if len(c_set) > max_candidates_per_entity:
-            final_candidates[s1_id] = set(list(c_set)[:max_candidates_per_entity])
-        else:
-            final_candidates[s1_id] = c_set
+    candidates_per_s1: Dict[str, Set[str]] = {}
+    provenance_per_pair: Dict[Tuple[str, str], Dict[str, float]] = {}
 
-    return final_candidates
+    iterator = enumerate(zip(s1_ids, norm_names, norm_addrs, postals))
+    if len(s1_ids) >= 100:
+        iterator = tqdm(iterator, total=len(s1_ids), desc=f"  [Blocking] RRF Query S1 ({len(s1_ids):,})", mininterval=0.5)
+
+    for q_idx, (s1_id, norm_name, norm_addr, postal) in iterator:
+        channels = lex_blocker.retrieve_channels(norm_name, norm_addr, postal)
+
+        if q_idx in dense_results and dense_results[q_idx]:
+            channels['dense'] = dense_results[q_idx]
+
+        ordered_cands, prov_map = compute_rrf_fusion(channels, max_candidates=max_candidates_per_entity)
+        candidates_per_s1[s1_id] = set(ordered_cands)
+
+        if return_provenance:
+            for tid, p_info in prov_map.items():
+                provenance_per_pair[(s1_id, tid)] = p_info
+
+    if return_provenance:
+        return candidates_per_s1, provenance_per_pair
+    return candidates_per_s1
 
 
 def run_hybrid_blocking(
     s1_df: pd.DataFrame,
     s23_df: pd.DataFrame,
     max_candidates_per_entity: int = MAX_CANDIDATES_PER_ENTITY,
-    dense_model_name: Optional[str] = None
-) -> Dict[str, Set[str]]:
+    dense_model_name: Optional[str] = None,
+    return_provenance: bool = False
+):
     """
-    Executes hybrid blocking (Sparse BM25 + Dense FAISS) for a single country partition.
+    Executes hybrid blocking (Sparse Multi-channel + Dense FAISS + RRF Fusion) for a single country partition.
     Convenience wrapper around fit_hybrid_blocker and query_hybrid_blocker.
     """
     lex_blocker, dense_blocker = fit_hybrid_blocker(
@@ -328,7 +451,8 @@ def run_hybrid_blocking(
         s1_df,
         lex_blocker,
         dense_blocker=dense_blocker,
-        max_candidates_per_entity=max_candidates_per_entity
+        max_candidates_per_entity=max_candidates_per_entity,
+        return_provenance=return_provenance
     )
 
 

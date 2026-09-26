@@ -120,7 +120,7 @@ def tune_decision_thresholds(
     for s1_id in all_s1_ids:
         c_list = entity_candidates.get(s1_id, [])
         if c_list:
-            s_list = sorted(c_list, key=lambda x: x[1], reverse=True)[:11]
+            s_list = sorted(c_list, key=lambda x: x[1], reverse=True)[:15]
             sorted_candidates[s1_id] = s_list
             max_probs[s1_id] = s_list[0][1]
         else:
@@ -202,17 +202,56 @@ def tune_decision_thresholds(
 
 
 
+def select_expected_f05(
+    candidates_with_probs: List[Tuple[str, float]],
+    tau_singleton: float = 0.45,
+    max_k: int = 15
+) -> List[str]:
+    """
+    Greedy Dynamic-K Set Selection maximizing expected Macro F0.5 utility:
+      E[F0.5(k)] = (5 * sum_{j=1}^k p_j) / (4 * k + sum_{j=1}^K p_j)
+    """
+    if not candidates_with_probs:
+        return []
+
+    sorted_c = sorted(candidates_with_probs, key=lambda x: x[1], reverse=True)[:max_k]
+    if not sorted_c or sorted_c[0][1] < tau_singleton:
+        return []
+
+    probs = [p for _, p in sorted_c]
+    total_prob_mass = sum(probs)
+    if total_prob_mass <= 0:
+        return []
+
+    best_k = 0
+    best_expected_utility = 0.0
+    cum_prob = 0.0
+
+    for k in range(1, len(sorted_c) + 1):
+        cum_prob += probs[k - 1]
+        denom = 4.0 * float(k) + total_prob_mass
+        util = (5.0 * cum_prob) / denom if denom > 0 else 0.0
+        if util > best_expected_utility:
+            best_expected_utility = util
+            best_k = k
+
+    if best_k == 0:
+        return []
+    return [tid for tid, _ in sorted_c[:best_k]]
+
+
 def apply_decision_rules(
     candidate_pairs: List[Tuple[str, str]],
     pred_probs: np.ndarray,
     all_s1_ids: List[str],
     match_threshold: float = 0.82,
     singleton_threshold: float = 0.75,
-    max_matches: int = 11
+    max_matches: int = 15,
+    use_expected_f05: bool = False
 ) -> Dict[str, Set[str]]:
     """
     Converts candidate match probabilities into final discrete entity match predictions
-    using metric-aligned thresholding and singleton protection.
+    using metric-aligned thresholding or expected F0.5 dynamic-k selection.
     """
     entity_candidates = defaultdict(list)
     for (s1_id, t_id), prob in zip(candidate_pairs, pred_probs):
@@ -225,13 +264,17 @@ def apply_decision_rules(
             final_matches[s1_id] = set()
             continue
 
-        max_p = max(p for _, p in c_list)
-        # Singleton Guardrail
-        if max_p < singleton_threshold:
-            final_matches[s1_id] = set()
-        else:
-            matches = [tid for tid, p in sorted(c_list, key=lambda x: x[1], reverse=True) if p >= match_threshold][:max_matches]
+        if use_expected_f05:
+            matches = select_expected_f05(c_list, tau_singleton=singleton_threshold, max_k=max_matches)
             final_matches[s1_id] = set(matches)
+        else:
+            max_p = max(p for _, p in c_list)
+            # Singleton Guardrail
+            if max_p < singleton_threshold:
+                final_matches[s1_id] = set()
+            else:
+                matches = [tid for tid, p in sorted(c_list, key=lambda x: x[1], reverse=True) if p >= match_threshold][:max_matches]
+                final_matches[s1_id] = set(matches)
 
     return final_matches
 

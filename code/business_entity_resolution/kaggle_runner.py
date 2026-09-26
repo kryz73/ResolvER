@@ -67,16 +67,17 @@ def main():
     parser.add_argument("--use-dense", action="store_true", help="Enable dense multilingual embedding blocking")
     parser.add_argument("--skip-test", action="store_true", help="Skip test set inference (useful for fast cross-validation diagnostics)")
     parser.add_argument("--test-sample-size", type=int, default=None, help="Sample size for test set inference verification")
+    parser.add_argument("--use-reranker", action="store_true", help="Enable multilingual cross-encoder reranking on hard ambiguous tail (T4 GPU recommended)")
     parser.add_argument("--team-name", type=str, default="tea_ml", help="Your team name for official submission zip")
     args = parser.parse_args()
 
-    # If dense blocking is requested, ensure faiss and sentence-transformers are present
-    if args.use_dense:
+    # If dense blocking or reranker is requested, ensure dependencies are present
+    if args.use_dense or args.use_reranker:
         try:
             import faiss
             import sentence_transformers
         except ImportError:
-            print("\n[Step 1b/5] Installing dense vector dependencies (faiss-cpu, sentence-transformers)...")
+            print("\n[Step 1b/5] Installing neural NLP dependencies (faiss-cpu, sentence-transformers)...")
             run_cmd(f"{sys.executable} -m pip install -q faiss-cpu sentence-transformers")
 
     # Check for GPU
@@ -89,6 +90,8 @@ def main():
         gpu_name = "None (PyTorch not found)"
 
     device = "cuda" if has_gpu else "cpu"
+    if has_gpu:
+        os.environ["USE_GPU"] = "1"
     print(f"  Compute Device: {device} ({gpu_name})")
 
     log_dir = "/kaggle/working/logs" if Path("/kaggle/working").exists() else "logs"
@@ -111,6 +114,7 @@ def main():
             test_mode=not args.skip_test,            # Generate test candidate_pairs.tsv and matching_results.tsv
             test_sample_size=args.test_sample_size,  # Test sample for verification
             use_dense=args.use_dense,                # Dense FAISS vector blocking flag
+            use_reranker=args.use_reranker,          # Selective cross-encoder reranker flag
             device=device,
             log_dir=log_dir,
             experiment_name="kaggle_run"

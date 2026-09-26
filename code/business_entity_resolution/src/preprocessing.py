@@ -11,64 +11,72 @@ from typing import Tuple, Dict, Set, Optional
 # Indic Unicode script ranges
 INDIC_REGEX = re.compile(r'[\u0900-\u0D7F]')
 
-# Common Legal Suffixes Mappings
-US_LEGAL_MAP = {
+# Common Legal Suffixes Mappings — Sorted longest-first to prevent partial prefix/suffix collisions
+US_LEGAL_MAP = dict(sorted({
+    r'\blimited liability partnership\b': 'llp',
+    r'\blimited liability company\b': 'llc',
     r'\bincorporated\b': 'inc',
     r'\bcorporation\b': 'corp',
-    r'\bcompany\b': 'co',
-    r'\blimited liability company\b': 'llc',
-    r'\blimited liability partnership\b': 'llp',
-    r'\blimited\b': 'ltd',
     r'\benterprises\b': 'ent',
     r'\bassociates\b': 'assoc',
-}
+    r'\blimited\b': 'ltd',
+    r'\bcompany\b': 'co',
+}.items(), key=lambda x: len(x[0]), reverse=True))
 
-INDIA_LEGAL_MAP = {
+INDIA_LEGAL_MAP = dict(sorted({
     r'\bprivate limited\b': 'pvt ltd',
     r'\bpvt\.?\s*ltd\.?\b': 'pvt ltd',
     r'\bp\.?\s*ltd\.?\b': 'pvt ltd',
-    r'\bprivate\b': 'pvt',
-    r'\blimited\b': 'ltd',
-    r'\bllp\b': 'llp',
     r'\benterprises\b': 'ent',
     r'\btrading\b': 'trd',
+    r'\bprivate\b': 'pvt',
+    r'\blimited\b': 'ltd',
     r'\bcompany\b': 'co',
-}
+    r'\bllp\b': 'llp',
+}.items(), key=lambda x: len(x[0]), reverse=True))
 
-FRANCE_LEGAL_MAP = {
-    r'\bsociete a responsabilite limitee\b': 'sarl',
+FRANCE_LEGAL_MAP = dict(sorted({
     r'\bsociete par actions simplifiee unipersonnelle\b': 'sasu',
-    r'\bsociete par actions simplifiee\b': 'sas',
     r'\bentreprise unipersonnelle a responsabilite limitee\b': 'eurl',
+    r'\bsociete a responsabilite limitee\b': 'sarl',
     r'\bsociete civile immobiliere\b': 'sci',
+    r'\bsociete par actions simplifiee\b': 'sas',
     r'\bsociete anonyme\b': 'sa',
     r'\bassociation\b': 'assoc',
-}
+}.items(), key=lambda x: len(x[0]), reverse=True))
 
-# French Street Normalizations
-FRANCE_STREET_MAP = {
+# French Street Normalizations — Longest-first
+FRANCE_STREET_MAP = dict(sorted({
     r'\bboulevard\b': 'bd',
-    r'\bbvd\b': 'bd',
-    r'\bavenue\b': 'av',
     r'\bimpasse\b': 'imp',
+    r'\bavenue\b': 'av',
     r'\bchemin\b': 'che',
-    r'\brue\b': 'rue',
     r'\ballee\b': 'all',
-}
+    r'\bbvd\b': 'bd',
+    r'\brue\b': 'rue',
+}.items(), key=lambda x: len(x[0]), reverse=True))
 
-# US Street Normalizations
-US_STREET_MAP = {
-    r'\bstreet\b': 'st',
-    r'\broad\b': 'rd',
-    r'\bavenue\b': 'ave',
+# US Street Normalizations — Longest-first
+US_STREET_MAP = dict(sorted({
     r'\bboulevard\b': 'blvd',
-    r'\bdrive\b': 'dr',
-    r'\blane\b': 'ln',
-    r'\bcourt\b': 'ct',
-    r'\bhighway\b': 'hwy',
-    r'\bsuite\b': 'ste',
     r'\bapartment\b': 'apt',
-}
+    r'\bhighway\b': 'hwy',
+    r'\bavenue\b': 'ave',
+    r'\bstreet\b': 'st',
+    r'\bsuite\b': 'ste',
+    r'\bcourt\b': 'ct',
+    r'\bdrive\b': 'dr',
+    r'\broad\b': 'rd',
+    r'\blane\b': 'ln',
+}.items(), key=lambda x: len(x[0]), reverse=True))
+
+
+def strip_accents(text: str) -> str:
+    """Folds Unicode accents (e.g. é -> e, ç -> c, ü -> u) via NFKD decomposition."""
+    if not text:
+        return ""
+    nfkd = unicodedata.normalize('NFKD', text)
+    return ''.join(c for c in nfkd if not unicodedata.combining(c))
 
 # Fast Indic transliteration fallback map (Devanagari to Latin approximation)
 DEVANAGARI_MAP = {
@@ -143,15 +151,36 @@ def transliterate_indic(text: str) -> str:
     return "".join(chars)
 
 
+ALL_LEGAL_SUFFIXES = {
+    'pvt ltd', 'ltd', 'llc', 'llp', 'inc', 'corp', 'co', 'ent', 'assoc', 'trd', 'pvt',
+    'sasu', 'eurl', 'sarl', 'sci', 'sas', 'sa'
+}
+
+
+def extract_core_brand(norm_name: str) -> str:
+    """Strips legal suffix to isolate the fundamental brand identity."""
+    words = norm_name.split()
+    if not words:
+        return ""
+    if len(words) >= 3 and f"{words[-2]} {words[-1]}" in ALL_LEGAL_SUFFIXES:
+        return " ".join(words[:-2])
+    if len(words) >= 2 and words[-1] in ALL_LEGAL_SUFFIXES:
+        return " ".join(words[:-1])
+    return norm_name
+
+
 def standardize_name(name: str, country: str) -> Tuple[str, str]:
     """
     Standardizes a business name:
-    Returns (normalized_name, transliterated_name)
+    Returns (cleaned_name, normalized_name)
+    - cleaned_name: lowercase NFKC text with raw character tokens preserved
+    - normalized_name: transliterated, accent-stripped, legal-form standardized Latin string
     """
     cleaned = basic_clean_text(name)
     trans = transliterate_indic(cleaned) if country == "India" else cleaned
+    trans = strip_accents(trans)
 
-    # Apply country legal mappings to transliterated text
+    # Apply country legal mappings to transliterated text (longest-first)
     if country == "US":
         for pat, repl in US_LEGAL_MAP.items():
             trans = re.sub(pat, repl, trans)
@@ -194,11 +223,12 @@ def extract_numbers_and_postal(address: str, country: str) -> Dict:
 
 
 def standardize_address(address: str, country: str) -> str:
-    """Standardizes address text, applying abbreviation expansions and cleaning."""
+    """Standardizes address text, applying abbreviation expansions, accent stripping and cleaning."""
     if not address or pd.isna(address) or str(address).strip().lower() == "nan":
         return ""
 
     cleaned = basic_clean_text(address)
+    cleaned = strip_accents(cleaned)
     if country == "India":
         cleaned = transliterate_indic(cleaned)
         # Clean Indian landmark prefixes
@@ -223,7 +253,8 @@ def preprocess_dataframe(df: pd.DataFrame, is_reference: bool = False, drop_raw_
     Applies high-speed preprocessing pipeline to a source dataframe using fast zip iteration:
     Adds:
       - 'clean_name': cleaned lowercase string
-      - 'norm_name': transliterated, legal-standardized Latin string
+      - 'norm_name': transliterated, accent-stripped, legal-standardized Latin string
+      - 'core_brand': brand identity with legal suffixes removed
       - 'norm_address': standardized address string
       - 'postal_code': extracted postal code (if found)
       - 'address_missing': boolean flag for missing address
@@ -238,6 +269,7 @@ def preprocess_dataframe(df: pd.DataFrame, is_reference: bool = False, drop_raw_
 
     clean_names = []
     norm_names = []
+    core_brands = []
     norm_addrs = []
     postals = []
     missing_flags = []
@@ -252,17 +284,20 @@ def preprocess_dataframe(df: pd.DataFrame, is_reference: bool = False, drop_raw_
         missing_flags.append(is_missing)
 
         c_name, n_name = standardize_name(raw_name, c)
+        c_brand = extract_core_brand(n_name)
         n_addr = standardize_address(raw_addr, c)
         p_info = extract_numbers_and_postal(raw_addr, c)
 
         clean_names.append(c_name)
         norm_names.append(n_name)
+        core_brands.append(c_brand)
         norm_addrs.append(n_addr)
         postals.append(p_info['postal'])
 
     df['address_missing'] = missing_flags
     df['clean_name'] = clean_names
     df['norm_name'] = norm_names
+    df['core_brand'] = core_brands
     df['norm_address'] = norm_addrs
     df['postal_code'] = postals
 

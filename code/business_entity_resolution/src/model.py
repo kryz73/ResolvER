@@ -54,28 +54,38 @@ class AsymmetricEntityMatcher:
         """Trains LightGBM classifier with early stopping on validation logloss."""
         self.feature_names = feature_names
         device_param = "gpu" if self.device == "cuda" else "cpu"
-
-        self.model = lgb.LGBMClassifier(
-            objective='binary',
-            boosting_type='gbdt',
-            learning_rate=self.learning_rate,
-            num_leaves=self.num_leaves,
-            n_estimators=self.n_estimators,
-            scale_pos_weight=self.scale_pos_weight,
-            random_state=self.random_state,
-            device=device_param,
-            n_jobs=-1,
-            verbose=-1
-        )
-
         eval_set = [(X_val, y_val)] if (X_val is not None and y_val is not None) else None
         callbacks = [lgb.early_stopping(stopping_rounds=30, verbose=False)] if eval_set else None
 
-        self.model.fit(
-            X_train, y_train,
-            eval_set=eval_set,
-            callbacks=callbacks
-        )
+        try:
+            self.model = lgb.LGBMClassifier(
+                objective='binary',
+                boosting_type='gbdt',
+                learning_rate=self.learning_rate,
+                num_leaves=self.num_leaves,
+                n_estimators=self.n_estimators,
+                scale_pos_weight=self.scale_pos_weight,
+                random_state=self.random_state,
+                device=device_param,
+                n_jobs=-1,
+                verbose=-1
+            )
+            self.model.fit(X_train, y_train, eval_set=eval_set, callbacks=callbacks)
+        except Exception:
+            # Fall back to CPU if LightGBM GPU build is not present in environment
+            self.model = lgb.LGBMClassifier(
+                objective='binary',
+                boosting_type='gbdt',
+                learning_rate=self.learning_rate,
+                num_leaves=self.num_leaves,
+                n_estimators=self.n_estimators,
+                scale_pos_weight=self.scale_pos_weight,
+                random_state=self.random_state,
+                device="cpu",
+                n_jobs=-1,
+                verbose=-1
+            )
+            self.model.fit(X_train, y_train, eval_set=eval_set, callbacks=callbacks)
 
     def get_feature_importances(self) -> np.ndarray:
         """Returns feature importance scores from trained LightGBM model."""
@@ -101,6 +111,51 @@ class AsymmetricEntityMatcher:
             data = pickle.load(f)
             self.model = data['model']
             self.feature_names = data['feature_names']
+
+
+class SelectiveCrossEncoderReranker:
+    """
+    Multilingual Cross-Encoder (BAAI/bge-reranker-v2-m3) that scores candidate pairs
+    selectively on the ambiguous tail (e.g. 0.35 <= prob <= 0.75 or top-K).
+    Accelerated with CUDA and FP16 when GPU is present (e.g. Kaggle T4 GPU).
+    """
+    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", top_k: int = 10, batch_size: int = 64):
+        self.model_name = model_name
+        self.top_k = top_k
+        self.batch_size = batch_size
+        self.model = None
+        try:
+            import torch
+            self.device = "cuda" if (torch.cuda.is_available() and os.environ.get("USE_GPU", "1") == "1") else "cpu"
+        except Exception:
+            self.device = "cpu"
+
+    def _init_model(self):
+        if self.model is None:
+            try:
+                from sentence_transformers import CrossEncoder
+                self.model = CrossEncoder(self.model_name, max_length=256, device=self.device)
+            except Exception as e:
+                print(f"  [Reranker Note] CrossEncoder init skipped or unavailable ({e}).")
+                self.model = None
+
+    def rerank_pairs(self, text_pairs: List[Tuple[str, str]]) -> np.ndarray:
+        """Computes cross-encoder probability scores for a list of (text1, text2) pairs."""
+        self._init_model()
+        if self.model is None or not text_pairs:
+            return np.zeros(len(text_pairs), dtype=np.float32)
+        try:
+            scores = self.model.predict(
+                text_pairs,
+                batch_size=self.batch_size,
+                show_progress_bar=(len(text_pairs) >= 5000)
+            )
+            # Normalize logits via sigmoid
+            probs = 1.0 / (1.0 + np.exp(-np.clip(scores, -15.0, 15.0)))
+            return np.ascontiguousarray(probs, dtype=np.float32)
+        except Exception as e:
+            print(f"  [Reranker Error] Pair prediction failed: {e}")
+            return np.zeros(len(text_pairs), dtype=np.float32)
 
 
 def train_5fold_cv(

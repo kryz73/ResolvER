@@ -23,8 +23,8 @@ Copy and paste the following cells into your Kaggle Notebook:
 
 ### Cell 1: Clone Project Repository & Install Packages
 ```python
-# 1. Install high-speed dependencies
-!pip install -q rapidfuzz indic-transliteration lightgbm
+# 1. Install high-speed dependencies & neural model libraries (if using T4 GPU)
+!pip install -q rapidfuzz indic-transliteration lightgbm sentence-transformers
 
 # 2. Clone your GitHub repository into /kaggle/working
 import os
@@ -42,16 +42,20 @@ if not Path('/kaggle/working/tea-ml').exists():
 
 ### Cell 2: Run the Pipeline on GPU
 
-You have two options:
+You have three options:
 1. **Option A (Quick Diagnostic Check ~2 mins):** Verify that the environment, blocking, and 5-fold CV run cleanly on 5,000 entities without waiting for the full 10M test set.
-2. **Option B (Full Run ~2.5 hrs):** Train on the full dataset, tune thresholds, perform full test set inference on 9.97M candidates, run the official validation script, and generate `submission.zip`.
+2. **Option B (Fast Competition Submission Run ~1.5 hrs):** Train on the full dataset with RRF + 38 domain features, tune thresholds, perform full test set inference on 9.97M candidates, run the official validation script, and generate `submission.zip`.
+3. **Option C (Full T4 GPU Neural Run with BGE-M3 + Reranker):** Utilize Kaggle dual T4 GPU for BGE-M3 dense semantic retrieval and selective cross-encoder reranking.
 
 ```python
 # --- OPTION A: Quick Diagnostic Run (5,000 entities, ~2 mins) ---
 # !python3 kaggle_runner.py --sample-size 5000 --skip-test
 
-# --- OPTION B: Full Competition Submission Run (Full Dataset) ---
+# --- OPTION B: Fast Full Submission Run (LightGBM + RRF + 38 Signals) ---
 !python3 kaggle_runner.py
+
+# --- OPTION C: Neural T4 GPU Run (BGE-M3 Dense + BGE-Reranker-v2-m3) ---
+# !python3 kaggle_runner.py --use-dense --use-reranker
 ```
 
 ---

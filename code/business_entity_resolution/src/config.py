@@ -122,7 +122,7 @@ TRAIN_COUNTRIES = ["US", "India"]
 TEST_COUNTRIES = ["US", "India", "France"]
 
 # Cardinality Bounds
-MAX_MATCHES_PER_ENTITY = 11  # Absolute empirical ceiling from ground truth
+MAX_MATCHES_PER_ENTITY = 15  # Dynamic expected F0.5 bound (retiring hard 11 cap)
 MAX_CANDIDATES_PER_ENTITY = 40  # Blocking budget per S1 entity
 MIN_SIMILARITY_BLOCKING = 0.55  # Dense cosine cutoff to prevent candidate flooding
 
@@ -139,11 +139,29 @@ SINGLETON_SWEEP_MIN = 0.25
 SINGLETON_SWEEP_MAX = 0.75
 SINGLETON_SWEEP_STEP = 0.05
 
-# Multilingual Transformer Model (Offline, Apache 2.0, 117M params)
-SBERT_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-EMBEDDING_DIM = 384
+# Multilingual Dense Retriever (BGE-M3: 560M params, 1024D, MIT License, Offline compatible)
+SBERT_MODEL_NAME = "BAAI/bge-m3"
+FALLBACK_SBERT_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+EMBEDDING_DIM = 1024
 MAX_SEQ_LENGTH = 256
 BATCH_SIZE = 128
+
+# Multilingual Cross-Encoder Reranker (BGE-Reranker-v2-m3: 560M params, Apache 2.0 License)
+RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
+ENABLE_RERANKER = False
+RERANK_TOP_K = 10
+RERANK_AMBIGUOUS_MIN = 0.35
+RERANK_AMBIGUOUS_MAX = 0.75
+
+# Reciprocal Rank Fusion (RRF) Parameters
+RRF_K = 20  # Constant factor smoothing ranks
+RRF_CHANNEL_WEIGHTS = {
+    'dense': 1.5,
+    'word': 1.2,
+    'locality': 1.0,
+    'postal': 1.0,
+    'char3': 0.8,
+}
 
 # Random Seed for Reproducibility
 RANDOM_SEED = 42
