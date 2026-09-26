@@ -100,24 +100,28 @@ def run_pipeline(
 
     # Efficient target loading when sampling vs full cloud run
     if train_sample_size and train_sample_size < len(s1_full):
-        tracker.log("Streaming target records (all true positive targets + distractor background)...")
-        s2_chunks = []
-        for chunk in tqdm(pd.read_csv(TRAIN_S2_PATH, sep="\t", chunksize=250000), desc="  [Data] Streaming Source 2 Chunks"):
-            hits = chunk[chunk['entity_id'].isin(target_ids_in_sample)]
-            distractors = chunk[~chunk['entity_id'].isin(target_ids_in_sample)].sample(frac=0.015, random_state=42)
-            s2_chunks.append(pd.concat([hits, distractors]))
-            if sum(len(c) for c in s2_chunks) > 100000:
-                break
-        s2_sample = pd.concat(s2_chunks, ignore_index=True)
+        tracker.log("Streaming target records (100% of true positive targets + distractor background)...")
+        s2_hits = []
+        s2_distractors = []
+        for chunk in tqdm(pd.read_csv(TRAIN_S2_PATH, sep="\t", chunksize=500000), desc="  [Data] Streaming Source 2 Chunks"):
+            h = chunk[chunk['entity_id'].isin(target_ids_in_sample)]
+            if len(h) > 0:
+                s2_hits.append(h)
+            if sum(len(d) for d in s2_distractors) < 75000:
+                d = chunk[~chunk['entity_id'].isin(target_ids_in_sample)].sample(frac=0.015, random_state=42)
+                s2_distractors.append(d)
+        s2_sample = pd.concat(s2_hits + s2_distractors, ignore_index=True)
 
-        s3_chunks = []
-        for chunk in tqdm(pd.read_csv(TRAIN_S3_PATH, sep="\t", chunksize=250000), desc="  [Data] Streaming Source 3 Chunks"):
-            hits = chunk[chunk['entity_id'].isin(target_ids_in_sample)]
-            distractors = chunk[~chunk['entity_id'].isin(target_ids_in_sample)].sample(frac=0.015, random_state=42)
-            s3_chunks.append(pd.concat([hits, distractors]))
-            if sum(len(c) for c in s3_chunks) > 100000:
-                break
-        s3_sample = pd.concat(s3_chunks, ignore_index=True)
+        s3_hits = []
+        s3_distractors = []
+        for chunk in tqdm(pd.read_csv(TRAIN_S3_PATH, sep="\t", chunksize=500000), desc="  [Data] Streaming Source 3 Chunks"):
+            h = chunk[chunk['entity_id'].isin(target_ids_in_sample)]
+            if len(h) > 0:
+                s3_hits.append(h)
+            if sum(len(d) for d in s3_distractors) < 75000:
+                d = chunk[~chunk['entity_id'].isin(target_ids_in_sample)].sample(frac=0.015, random_state=42)
+                s3_distractors.append(d)
+        s3_sample = pd.concat(s3_hits + s3_distractors, ignore_index=True)
         s23_train = pd.concat([s2_sample, s3_sample], ignore_index=True).drop_duplicates(subset=['entity_id'])
     else:
         tracker.log("Loading complete target tables (Sources 2 and 3)...")

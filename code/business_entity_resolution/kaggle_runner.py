@@ -66,6 +66,7 @@ def main():
     parser.add_argument("--sample-size", type=int, default=None, help="Train sample size (default: None for full Kaggle dataset)")
     parser.add_argument("--use-dense", action="store_true", help="Enable dense multilingual embedding blocking")
     parser.add_argument("--skip-test", action="store_true", help="Skip test set inference (useful for fast cross-validation diagnostics)")
+    parser.add_argument("--team-name", type=str, default="tea_ml", help="Your team name for official submission zip")
     args = parser.parse_args()
 
     # If dense blocking is requested, ensure faiss and sentence-transformers are present
@@ -137,23 +138,55 @@ def main():
         print(f"\n--- TOP FALSE POSITIVES (Total: {len(fp_df)}) ---")
         print(fp_df[['s1_id', 'target_id', 'prob', 's1_name', 'target_name']].head(5).to_string(index=False))
 
-    # 5. Packaging Submission Zip
+    # 5. Packaging Submission Files According to Guidelines
     if not args.skip_test and (OUTPUT_MATCHING_PATH.exists() or OUTPUT_CANDIDATE_PATH.exists()):
-        print("\n[Step 5/5] Packaging Submission Zip...")
+        print("\n[Step 5/5] Packaging Submission Files According to Guidelines...")
         working_dir = Path("/kaggle/working") if Path("/kaggle/working").exists() else OUTPUT_DIR
         working_dir.mkdir(parents=True, exist_ok=True)
-        zip_path = working_dir / "submission.zip"
 
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        team_slug = args.team_name.strip().replace(" ", "_")
+        full_pkg_path = working_dir / f"{team_slug}_submission.zip"
+        leaderboard_zip_path = working_dir / "submission.zip"
+
+        # 1. Standard Leaderboard zip (matching_results.tsv + candidate_pairs.tsv)
+        with zipfile.ZipFile(leaderboard_zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
             if OUTPUT_MATCHING_PATH.exists():
                 zipf.write(OUTPUT_MATCHING_PATH, arcname="matching_results.tsv")
-                print(f"  Added matching_results.tsv ({OUTPUT_MATCHING_PATH.stat().st_size:,} bytes)")
+                print(f"  [Leaderboard File] Added matching_results.tsv ({OUTPUT_MATCHING_PATH.stat().st_size:,} bytes)")
             if OUTPUT_CANDIDATE_PATH.exists():
                 zipf.write(OUTPUT_CANDIDATE_PATH, arcname="candidate_pairs.tsv")
-                print(f"  Added candidate_pairs.tsv ({OUTPUT_CANDIDATE_PATH.stat().st_size:,} bytes)")
+                print(f"  [Candidate File] Added candidate_pairs.tsv ({OUTPUT_CANDIDATE_PATH.stat().st_size:,} bytes)")
 
-        print(f"\n>> SUCCESS: Submission package ready at: {zip_path} <<")
-        print("You can download submission.zip directly from the Kaggle Output panel.")
+        # 2. Official Final Submission Package (<team_name>_submission.zip per guidelines)
+        with zipfile.ZipFile(full_pkg_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+            # output/
+            if OUTPUT_MATCHING_PATH.exists():
+                zipf.write(OUTPUT_MATCHING_PATH, arcname="output/matching_results.tsv")
+            if OUTPUT_CANDIDATE_PATH.exists():
+                zipf.write(OUTPUT_CANDIDATE_PATH, arcname="output/candidate_pairs.tsv")
+
+            # code/business_entity_resolution/
+            code_base = Path(__file__).parent
+            for file_path in code_base.rglob("*"):
+                if file_path.is_file() and not any(part in file_path.parts for part in ["__pycache__", ".git", "venv", "logs", "artifacts"]):
+                    arc = f"code/business_entity_resolution/{file_path.relative_to(code_base)}"
+                    zipf.write(file_path, arcname=arc)
+
+            # Documentation_template.md
+            for doc in [
+                Path("../../student_resource/Documentation_template.md"),
+                Path("../../../student_resource/Documentation_template.md"),
+                Path("/kaggle/working/tea-ml/student_resource/Documentation_template.md")
+            ]:
+                if doc.exists():
+                    zipf.write(doc, arcname="Documentation_template.md")
+                    break
+
+        print(f"\n>> SUCCESS: Generated Files According to Competition Guidelines: <<")
+        print(f"  1. Live Portal Leaderboard File: {OUTPUT_MATCHING_PATH}")
+        print(f"  2. Leaderboard Zip Archive:      {leaderboard_zip_path}")
+        print(f"  3. Official Final Package:       {full_pkg_path}")
+        print("All files are ready for download from the Kaggle Output panel.")
     else:
         print("\n[Step 5/5] Skipping Submission Packaging (Evaluation mode only, test inference skipped).")
 

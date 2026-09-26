@@ -132,12 +132,12 @@ DEFAULT_MATCH_THRESHOLD = 0.82  # Conservative classification decision boundary
 SINGLETON_THRESHOLD = 0.75  # Guardrail: if max_prob < SINGLETON_THRESHOLD -> declare singleton
 
 # Threshold Search Sweep Ranges (Empirically grounded for asymmetric loss)
-TAU_SWEEP_MIN = 0.30
+TAU_SWEEP_MIN = 0.35
 TAU_SWEEP_MAX = 0.85
-TAU_SWEEP_STEP = 0.02
+TAU_SWEEP_STEP = 0.04
 SINGLETON_SWEEP_MIN = 0.25
 SINGLETON_SWEEP_MAX = 0.75
-SINGLETON_SWEEP_STEP = 0.02
+SINGLETON_SWEEP_STEP = 0.05
 
 # Multilingual Transformer Model (Offline, Apache 2.0, 117M params)
 SBERT_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"

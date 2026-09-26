@@ -110,14 +110,30 @@ def tune_decision_thresholds(
     to directly maximize the Macro F0.5 evaluation metric on OOF validation predictions.
     Returns: (best_tau, best_tau_single, best_macro_f05, tuning_records)
     """
-    # Group predictions by S1 entity
+    # Group and pre-sort predictions by S1 entity once (massive speedup)
     entity_candidates = defaultdict(list)
     for (s1_id, t_id), prob in zip(candidate_pairs, pred_probs):
         entity_candidates[s1_id].append((t_id, float(prob)))
 
+    sorted_candidates = {}
+    max_probs = {}
+    for s1_id in all_s1_ids:
+        c_list = entity_candidates.get(s1_id, [])
+        if c_list:
+            s_list = sorted(c_list, key=lambda x: x[1], reverse=True)[:11]
+            sorted_candidates[s1_id] = s_list
+            max_probs[s1_id] = s_list[0][1]
+        else:
+            sorted_candidates[s1_id] = []
+            max_probs[s1_id] = 0.0
+
+    gt_sets = {sid: ground_truth.get(sid, set()) for sid in all_s1_ids}
+    gt_lens = {sid: len(gt_sets[sid]) for sid in all_s1_ids}
+    n_entities = float(len(all_s1_ids)) if all_s1_ids else 1.0
+
     best_score = -1.0
-    best_tau = 0.82
-    best_tau_single = 0.75
+    best_tau = 0.55
+    best_tau_single = 0.45
     best_preds = {}
     tuning_records = []
 
@@ -127,23 +143,36 @@ def tune_decision_thresholds(
     print(f"  [Threshold Tuning] Grid searching tau in [{TAU_SWEEP_MIN:.2f}, {TAU_SWEEP_MAX:.2f}] & tau_single in [{SINGLETON_SWEEP_MIN:.2f}, {SINGLETON_SWEEP_MAX:.2f}]...")
     for tau in tqdm(tau_range, desc="  [Threshold Tuning] Grid Search", mininterval=0.5):
         for tau_single in singleton_range:
-            preds = {}
-            for s1_id in all_s1_ids:
-                c_list = entity_candidates.get(s1_id, [])
-                if not c_list:
-                    preds[s1_id] = set()
+            total_score = 0.0
+            for sid in all_s1_ids:
+                m_p = max_probs[sid]
+                n_true = gt_lens[sid]
+                if m_p < tau_single:
+                    if n_true == 0:
+                        total_score += 1.0
                     continue
 
-                max_p = max(p for _, p in c_list)
-                # Singleton Bouncer: if best probability < tau_single, predict empty
-                if max_p < tau_single:
-                    preds[s1_id] = set()
-                else:
-                    # Filter candidates above tau, sort by prob, cap at 11
-                    filtered = [tid for tid, p in sorted(c_list, key=lambda x: x[1], reverse=True) if p >= tau][:11]
-                    preds[s1_id] = set(filtered)
+                c_list = sorted_candidates[sid]
+                pred_list = [tid for tid, p in c_list if p >= tau]
+                n_pred = len(pred_list)
 
-            score = evaluate_macro_f05(preds, ground_truth, all_s1_ids)
+                if n_pred == 0 and n_true == 0:
+                    total_score += 1.0
+                    continue
+                if n_pred == 0 or n_true == 0:
+                    continue
+
+                tp = sum(1 for tid in pred_list if tid in gt_sets[sid])
+                if tp == 0:
+                    continue
+
+                prec = float(tp) / float(n_pred)
+                rec = float(tp) / float(n_true)
+                denom = 0.25 * prec + rec
+                if denom > 0:
+                    total_score += (1.25 * prec * rec) / denom
+
+            score = total_score / n_entities
             tuning_records.append({
                 "tau": round(float(tau), 4),
                 "tau_singleton": round(float(tau_single), 4),
@@ -153,7 +182,13 @@ def tune_decision_thresholds(
                 best_score = score
                 best_tau = float(tau)
                 best_tau_single = float(tau_single)
-                best_preds = preds
+
+    # Reconstruct best predictions for stratified report
+    for sid in all_s1_ids:
+        if max_probs[sid] < best_tau_single:
+            best_preds[sid] = set()
+        else:
+            best_preds[sid] = {tid for tid, p in sorted_candidates[sid] if p >= best_tau}
 
     strat = evaluate_stratified_f05(best_preds, ground_truth, all_s1_ids)
     print(f"  [Threshold Tuning] Best Macro F0.5 = {best_score:.4f} (tau={best_tau:.3f}, tau_single={best_tau_single:.3f})")
