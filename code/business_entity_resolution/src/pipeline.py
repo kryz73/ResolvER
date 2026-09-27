@@ -14,7 +14,6 @@ from collections import defaultdict
 from typing import Dict, List, Set, Tuple, Optional
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 from config import (
     TRAIN_S1_PATH, TRAIN_S2_PATH, TRAIN_S3_PATH, TRAIN_GT_PATH,
@@ -37,7 +36,7 @@ from postprocessing import (
     evaluate_macro_f05, tune_decision_thresholds,
     apply_decision_rules, write_matching_results_tsv
 )
-from logger import ExperimentTracker
+from logger import ExperimentTracker, make_progress_bar
 
 
 def load_ground_truth(gt_path: str) -> Dict[str, Set[str]]:
@@ -90,6 +89,7 @@ def run_pipeline(
     })
 
     model_checkpoint = str(ARTIFACT_DIR / "matcher_model.pkl")
+    val_macro_f05 = 0.0
 
     if test_only:
         test_mode = True
@@ -139,6 +139,7 @@ def run_pipeline(
                             s_data = json.load(sf)
                         best_tau = float(s_data.get("threshold_metrics", {}).get("optimal_tau", best_tau))
                         best_tau_single = float(s_data.get("threshold_metrics", {}).get("optimal_singleton_tau", best_tau_single))
+                        val_macro_f05 = float(s_data.get("threshold_metrics", {}).get("validation_macro_f05", 0.0))
                         tracker.log(f"Auto-loaded calibrated operating thresholds from {sc}: tau = {best_tau:.3f}, tau_singleton = {best_tau_single:.3f}")
                         break
                     except Exception:
@@ -154,6 +155,7 @@ def run_pipeline(
         sample_desc = f"{train_sample_size:,}" if train_sample_size else "FULL DATASET (Cloud GPU)"
         tracker.log(f"Phase 1: Loading Training Reference & Targets (Sample: {sample_desc})...")
 
+        t_s1_start = time.time()
         s1_full = pd.read_csv(TRAIN_S1_PATH, sep="\t")
         if train_sample_size is not None:
             if isinstance(train_sample_size, float) and 0.0 < train_sample_size < 1.0:
@@ -170,6 +172,7 @@ def run_pipeline(
         s1_train_ids = set(s1_train['entity_id'])
         gt_all = load_ground_truth(str(TRAIN_GT_PATH))
         gt_train = {sid: gt_all[sid] for sid in s1_train_ids if sid in gt_all}
+        tracker.add_time("p1_s1_loading", time.time() - t_s1_start, category="sub")
     
         # Collect target IDs matching the S1 sample
         target_ids_in_sample = set()
@@ -177,13 +180,14 @@ def run_pipeline(
             target_ids_in_sample.update(s_set)
     
         # Efficient target loading when sampling vs full cloud run
+        t_tgt_start = time.time()
         if len(s1_train) < len(s1_full):
-            tracker.log(f"Streaming target records (100% of true positive targets + scaled distractor background for {len(s1_train):,} entities)...")
+            tracker.log(f"Streaming target records (100% of true positive targets + scaled distractor background for {len(s1_train):,} entities)...", terminal=False)
             max_distractors_per_source = max(75000, int(len(s1_train) * 0.75))
             distractor_frac = min(0.04, max(0.015, (len(s1_train) / len(s1_full)) * 0.25))
             s2_hits = []
             s2_distractors = []
-            for chunk in tqdm(pd.read_csv(TRAIN_S2_PATH, sep="\t", chunksize=500000), desc="  [Data] Streaming Source 2 Chunks"):
+            for chunk in make_progress_bar(pd.read_csv(TRAIN_S2_PATH, sep="\t", chunksize=500000), desc="Streaming Source 2 Chunks", mininterval=2.0, leave=False):
                 h = chunk[chunk['entity_id'].isin(target_ids_in_sample)]
                 if len(h) > 0:
                     s2_hits.append(h)
@@ -194,7 +198,7 @@ def run_pipeline(
     
             s3_hits = []
             s3_distractors = []
-            for chunk in tqdm(pd.read_csv(TRAIN_S3_PATH, sep="\t", chunksize=500000), desc="  [Data] Streaming Source 3 Chunks"):
+            for chunk in make_progress_bar(pd.read_csv(TRAIN_S3_PATH, sep="\t", chunksize=500000), desc="Streaming Source 3 Chunks", mininterval=2.0, leave=False):
                 h = chunk[chunk['entity_id'].isin(target_ids_in_sample)]
                 if len(h) > 0:
                     s3_hits.append(h)
@@ -204,30 +208,31 @@ def run_pipeline(
             s3_sample = pd.concat(s3_hits + s3_distractors, ignore_index=True)
             s23_train = pd.concat([s2_sample, s3_sample], ignore_index=True).drop_duplicates(subset=['entity_id'])
         else:
-            tracker.log("Loading complete target tables (Sources 2 and 3) via streaming...")
+            tracker.log("Loading complete target tables (Sources 2 and 3) via streaming...", terminal=False)
             s2_chunks = []
-            for chunk in tqdm(pd.read_csv(TRAIN_S2_PATH, sep="\t", chunksize=500_000),
-                              desc="  [Data] Streaming Source 2"):
+            for chunk in make_progress_bar(pd.read_csv(TRAIN_S2_PATH, sep="\t", chunksize=500_000),
+                                           desc="Streaming Source 2 targets", mininterval=2.0, leave=False):
                 s2_chunks.append(chunk)
             s2_full = pd.concat(s2_chunks, ignore_index=True)
             del s2_chunks
     
             s3_chunks = []
-            for chunk in tqdm(pd.read_csv(TRAIN_S3_PATH, sep="\t", chunksize=500_000),
-                              desc="  [Data] Streaming Source 3"):
+            for chunk in make_progress_bar(pd.read_csv(TRAIN_S3_PATH, sep="\t", chunksize=500_000),
+                                           desc="Streaming Source 3 targets", mininterval=2.0, leave=False):
                 s3_chunks.append(chunk)
             s3_full = pd.concat(s3_chunks, ignore_index=True)
             del s3_chunks
     
             s23_train = pd.concat([s2_full, s3_full], ignore_index=True).drop_duplicates(subset=['entity_id'])
             del s2_full, s3_full
+        tracker.add_time("p1_target_streaming", time.time() - t_tgt_start, category="sub")
     
         tracker.log(f"Loaded: {len(s1_train):,} Reference S1 | {len(s23_train):,} Target Records (S2+S3)")
     
         # Determine whether to drop raw columns (save memory on large datasets)
         n_targets_total = len(s23_train)
         drop_raw = n_targets_total > 100_000
-        tracker.log("Executing high-speed vectorized text cleaning, transliteration, and postal normalization...")
+        tracker.log("Executing high-speed vectorized text cleaning, transliteration, and postal normalization...", terminal=False)
         s1_train_proc = preprocess_dataframe(s1_train, is_reference=True, drop_raw_columns=drop_raw)
         s23_train_proc = preprocess_dataframe(s23_train, is_reference=False, drop_raw_columns=drop_raw)
         del s23_train
@@ -251,7 +256,8 @@ def run_pipeline(
                 s1_c, s23_c,
                 max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY,
                 dense_model_name=dense_model,
-                return_provenance=True
+                return_provenance=True,
+                tracker=tracker
             )
             all_candidates.update(c_dict)
             train_provenance.update(prov_dict)
@@ -422,6 +428,29 @@ def run_pipeline(
         else:
             test_s1_to_process = test_s1_full
 
+        # Fix 1.5: Preprocess Test S1 globally and compute name frequencies once across full test set
+        tracker.log("Preprocessing Test S1 entities globally...")
+        t_p6_s1 = time.time()
+        test_s1_proc = preprocess_dataframe(test_s1_to_process, is_reference=True, drop_raw_columns=True)
+        global_test_s1_freqs = test_s1_proc['norm_name'].value_counts().to_dict()
+        tracker.add_time("p6_s1_preprocess", time.time() - t_p6_s1, category="sub")
+        tracker.log(f"Global Test S1 frequencies computed: {len(global_test_s1_freqs):,} unique names across {len(test_s1_proc):,} entities.")
+
+        # Fix 2.3: Single-pass streaming of S2 and S3 targets partitioned by country
+        tracker.log("Streaming S2 and S3 targets in a single pass (partitioned by country)...")
+        t_p6_tgt_stream = time.time()
+        s23_by_country = {c: [] for c in ["US", "India", "France"]}
+        for s_path, s_name in [(TEST_S2_PATH, "S2"), (TEST_S3_PATH, "S3")]:
+            tracker.log(f"  Streaming {s_name} from {s_path}...")
+            for chunk in make_progress_bar(pd.read_csv(s_path, sep="\t", chunksize=500_000),
+                                           desc=f"  Streaming {s_name}", mininterval=2.0, leave=False):
+                for c in ["US", "India", "France"]:
+                    sub = chunk[chunk['country'] == c]
+                    if len(sub) > 0:
+                        s23_by_country[c].append(sub)
+        gc.collect()
+        tracker.add_time("p6_target_streaming", time.time() - t_p6_tgt_stream, category="sub")
+
         # Initialize output files with headers (will append per-shard results)
         os.makedirs(os.path.dirname(str(OUTPUT_MATCHING_PATH)), exist_ok=True)
         os.makedirs(os.path.dirname(str(OUTPUT_CANDIDATE_PATH)), exist_ok=True)
@@ -438,54 +467,39 @@ def run_pipeline(
             tracker.log(f"{'─' * 70}")
 
             # ── 6a. Load only this country's S1 ──
-            shard_s1 = test_s1_to_process[test_s1_to_process['country'] == country].reset_index(drop=True)
-            if len(shard_s1) == 0:
+            shard_s1_proc = test_s1_proc[test_s1_proc['country'] == country].reset_index(drop=True)
+            if len(shard_s1_proc) == 0:
                 tracker.log(f"  [{country}] No S1 entities found, skipping.")
                 continue
-            tracker.log(f"  [{country}] S1 entities: {len(shard_s1):,}")
+            tracker.log(f"  [{country}] S1 entities: {len(shard_s1_proc):,}")
 
-            # ── 6b. Stream-load only this country's S2+S3 targets ──
-            tracker.log(f"  [{country}] Streaming S2 targets (country filter)...")
-            s2_chunks = []
-            for chunk in tqdm(pd.read_csv(TEST_S2_PATH, sep="\t", chunksize=500_000),
-                              desc=f"  [{country}] Streaming S2", mininterval=1.0):
-                filtered = chunk[chunk['country'] == country]
-                if len(filtered) > 0:
-                    s2_chunks.append(filtered)
-            shard_s2 = pd.concat(s2_chunks, ignore_index=True) if s2_chunks else pd.DataFrame()
-            del s2_chunks
-            gc.collect()
-
-            tracker.log(f"  [{country}] Streaming S3 targets (country filter)...")
-            s3_chunks = []
-            for chunk in tqdm(pd.read_csv(TEST_S3_PATH, sep="\t", chunksize=500_000),
-                              desc=f"  [{country}] Streaming S3", mininterval=1.0):
-                filtered = chunk[chunk['country'] == country]
-                if len(filtered) > 0:
-                    s3_chunks.append(filtered)
-            shard_s3 = pd.concat(s3_chunks, ignore_index=True) if s3_chunks else pd.DataFrame()
-            del s3_chunks
-            gc.collect()
-
-            shard_s23 = pd.concat([shard_s2, shard_s3], ignore_index=True).drop_duplicates(subset=['entity_id'])
-            del shard_s2, shard_s3
+            # ── 6b. Assemble and deduplicate this country's S2+S3 targets ──
+            raw_country_chunks = s23_by_country.pop(country, [])
+            if raw_country_chunks:
+                shard_s23 = pd.concat(raw_country_chunks, ignore_index=True).drop_duplicates(subset=['entity_id'])
+            else:
+                shard_s23 = pd.DataFrame()
+            del raw_country_chunks
             gc.collect()
             tracker.log(f"  [{country}] Loaded {len(shard_s23):,} target records (S2+S3)")
 
-            # ── 6c. Preprocess (drop raw columns to save memory) ──
-            tracker.log(f"  [{country}] Preprocessing...")
-            shard_s1_proc = preprocess_dataframe(shard_s1, is_reference=True, drop_raw_columns=True)
+            # ── 6c. Preprocess targets (drop raw columns to save memory) ──
+            tracker.log(f"  [{country}] Preprocessing targets...")
+            t_p6_tgt_proc = time.time()
             shard_s23_proc = preprocess_dataframe(shard_s23, is_reference=False, drop_raw_columns=True)
-            del shard_s1, shard_s23
+            del shard_s23
             gc.collect()
+            tracker.add_time("p6_target_preprocess", time.time() - t_p6_tgt_proc, category="sub")
 
             # ── 6d. Fit Blocker on Shard Targets ──
             tracker.log(f"  [{country}] Indexing {len(shard_s23_proc):,} target records for blocking...")
+            t_p6_idx = time.time()
             lex_blocker, dense_blocker = fit_hybrid_blocker(
                 shard_s23_proc,
                 max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY,
                 dense_model_name=dense_model
             )
+            tracker.add_time("p6_blocker_indexing", time.time() - t_p6_idx, category="sub")
 
             # Index target DataFrame by entity_id for fast on-demand batch lookup (eliminates 8.5GB dictionary overhead)
             shard_s23_indexed = shard_s23_proc.set_index('entity_id')
@@ -507,10 +521,12 @@ def run_pipeline(
                 batch_candidates, batch_prov = query_hybrid_blocker(
                     batch_s1_df, lex_blocker, dense_blocker=dense_blocker,
                     max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY,
-                    return_provenance=True
+                    return_provenance=True,
+                    tracker=tracker
                 )
 
                 # Write candidate_pairs.tsv (append mode)
+                t_p6_tsv = time.time()
                 write_mode = "w" if not candidate_header_written else "a"
                 with open(str(OUTPUT_CANDIDATE_PATH), write_mode, encoding="utf-8") as f:
                     if not candidate_header_written:
@@ -523,24 +539,26 @@ def run_pipeline(
                         else:
                             f.write(f"{s1_id}\t\n")
                         written_s1_ids.add(s1_id)
+                tracker.add_time("p6_tsv_writing", time.time() - t_p6_tsv, category="sub")
 
                 # Build lookup dict ONLY for targets retrieved in this batch (< 50MB instead of 8.5GB)
                 needed_tids = list({tid for cset in batch_candidates.values() for tid in cset if tid in shard_s23_indexed.index})
                 batch_target_lookup = shard_s23_indexed.loc[needed_tids].to_dict('index')
 
                 # Extract features + score in 250K chunks with candidate provenance
+                t_p6_feat = time.time()
                 batch_pairs = [(sid, tid) for sid, cset in batch_candidates.items() for tid in cset]
                 batch_s1_lookup = batch_s1_df.set_index('entity_id').to_dict('index')
-                batch_s1_freqs = batch_s1_df['norm_name'].value_counts().to_dict()
 
                 scored_triples = extract_features_and_score_chunked(
-                    batch_pairs, batch_s1_lookup, batch_target_lookup, batch_s1_freqs,
+                    batch_pairs, batch_s1_lookup, batch_target_lookup, global_test_s1_freqs,
                     matcher, chunk_size=250_000,
                     provenance_map=batch_prov
                 )
-                del batch_target_lookup
+                tracker.add_time("p6_feature_scoring", time.time() - t_p6_feat, category="sub")
 
                 # Optional Selective Cross-Encoder Reranking on the ambiguous probability tail
+                t_p6_rerank = time.time()
                 if reranker is not None and reranker.model is not None:
                     # Group ambiguous pairs by s1 entity and take at most RERANK_TOP_K
                     s1_ambiguous = defaultdict(list)
@@ -557,7 +575,7 @@ def run_pipeline(
                         pairs_to_rerank = [
                             (
                                 f"{batch_s1_lookup.get(scored_triples[i][0], {}).get('norm_name', '')} {batch_s1_lookup.get(scored_triples[i][0], {}).get('norm_address', '')}",
-                                f"{target_lookup.get(scored_triples[i][1], {}).get('norm_name', '')} {target_lookup.get(scored_triples[i][1], {}).get('norm_address', '')}"
+                                f"{batch_target_lookup.get(scored_triples[i][1], {}).get('norm_name', '')} {batch_target_lookup.get(scored_triples[i][1], {}).get('norm_address', '')}"
                             )
                             for i in ambiguous_indices
                         ]
@@ -568,8 +586,9 @@ def run_pipeline(
                             blended_p = 0.5 * orig_p + 0.5 * float(r_score)
                             updated_triples[idx] = (sid, tid, blended_p)
                         scored_triples = updated_triples
+                tracker.add_time("p6_reranker", time.time() - t_p6_rerank, category="sub")
 
-                del batch_s1_lookup, batch_s1_freqs, batch_pairs, batch_candidates, batch_prov
+                del batch_target_lookup, batch_s1_lookup, batch_pairs, batch_candidates, batch_prov
                 gc.collect()
 
                 # Group scores by S1 entity and apply thresholds
@@ -579,6 +598,7 @@ def run_pipeline(
                 del scored_triples
                 gc.collect()
 
+                t_p6_tsv2 = time.time()
                 write_mode = "w" if not matching_header_written else "a"
                 with open(str(OUTPUT_MATCHING_PATH), write_mode, encoding="utf-8") as f:
                     if not matching_header_written:
@@ -597,6 +617,7 @@ def run_pipeline(
                             matches = [tid for tid, p in sorted(c_list, key=lambda x: x[1], reverse=True)
                                        if p >= best_tau][:MAX_MATCHES_PER_ENTITY]
                             f.write(f"{s1_id}\t{','.join(matches)}\n")
+                tracker.add_time("p6_tsv_writing", time.time() - t_p6_tsv2, category="sub")
 
                 del entity_preds
                 gc.collect()
@@ -616,13 +637,14 @@ def run_pipeline(
                 for s1_id in sorted(missing_s1):
                     f.write(f"{s1_id}\t\n")
 
-        del test_s1_full
+        del test_s1_full, test_s1_proc, global_test_s1_freqs
         gc.collect()
 
         tracker.log(f"\nTest inference complete: {total_test_s1:,} S1 entities processed across 3 country shards.")
         tracker.stop_timer("test_inference")
 
         # Official Validator
+        t_p6_val = time.time()
         tracker.log("\n" + "=" * 80)
         tracker.log("RUNNING OFFICIAL COMPETITION VALIDATION SCRIPT")
         tracker.log("=" * 80)
@@ -636,6 +658,11 @@ def run_pipeline(
                 tracker.log(f">> WARNING: Validator exited with code {ret}. Review output above. <<", level="warning")
         else:
             tracker.log(f">> Note: Validator script not found at {VALIDATE_SCRIPT}. Skipping automated check. <<")
+        tracker.add_time("p6_validator", time.time() - t_p6_val, category="sub")
+
+        # Finalize and print full timing summary table
+        final_f05 = val_macro_f05 if 'val_macro_f05' in locals() else 0.0
+        tracker.finalize(final_f05, best_tau, best_tau_single)
 
 
 def run_loco_evaluation(
@@ -683,7 +710,7 @@ def run_loco_evaluation(
 
     # Load targets (Sources 2 and 3)
     s2_chunks = []
-    for chunk in tqdm(pd.read_csv(TRAIN_S2_PATH, sep="\t", chunksize=250000), desc="  [Data] Streaming Source 2 Chunks"):
+    for chunk in make_progress_bar(pd.read_csv(TRAIN_S2_PATH, sep="\t", chunksize=250000), desc="  [Data] Streaming Source 2 Chunks", mininterval=2.0, leave=False):
         hits = chunk[chunk['entity_id'].isin(needed_targets)]
         distractors = chunk[~chunk['entity_id'].isin(needed_targets)].sample(frac=0.015, random_state=42)
         s2_chunks.append(pd.concat([hits, distractors]))
@@ -692,7 +719,7 @@ def run_loco_evaluation(
     s2_sample = pd.concat(s2_chunks, ignore_index=True)
 
     s3_chunks = []
-    for chunk in tqdm(pd.read_csv(TRAIN_S3_PATH, sep="\t", chunksize=250000), desc="  [Data] Streaming Source 3 Chunks"):
+    for chunk in make_progress_bar(pd.read_csv(TRAIN_S3_PATH, sep="\t", chunksize=250000), desc="  [Data] Streaming Source 3 Chunks", mininterval=2.0, leave=False):
         hits = chunk[chunk['entity_id'].isin(needed_targets)]
         distractors = chunk[~chunk['entity_id'].isin(needed_targets)].sample(frac=0.015, random_state=42)
         s3_chunks.append(pd.concat([hits, distractors]))

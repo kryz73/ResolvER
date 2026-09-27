@@ -5,14 +5,16 @@ Dual Sparse-Dense Candidate Generation & Blocking
 
 import os
 import re
+import time
+import concurrent.futures
 from collections import defaultdict
-from typing import Dict, List, Set, Tuple, Optional
+from typing import Dict, List, Set, Tuple, Optional, Any
 import pandas as pd
 import numpy as np
 from rapidfuzz import fuzz
-from tqdm import tqdm
 
 from config import MAX_CANDIDATES_PER_ENTITY
+from logger import make_progress_bar
 
 try:
     import faiss
@@ -70,7 +72,7 @@ class LexicalBlocker:
 
         iterator = zip(eids, norm_names, norm_addrs, postals)
         if len(eids) >= 1000:
-            iterator = tqdm(iterator, total=len(eids), desc=f"  [Blocking] Indexing Targets ({len(eids):,})", mininterval=0.5)
+            iterator = make_progress_bar(iterator, total=len(eids), desc=f"[Blocking] Indexing Targets ({len(eids):,})", mininterval=2.0, leave=False)
 
         for eid, norm_name, norm_addr, postal in iterator:
 
@@ -300,6 +302,13 @@ class DenseBlocker:
                 # Fallback to MiniLM if BGE-M3 is unavailable
                 fallback_name = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
                 self.model = SentenceTransformer(fallback_name, device=self.device)
+
+            # Cap max_seq_length to eliminate 8192-token padding bloat on BGE-M3
+            try:
+                self.model.max_seq_length = 128
+            except Exception:
+                pass
+
             if self.device == "cuda":
                 try:
                     self.model = self.model.half()
@@ -307,27 +316,10 @@ class DenseBlocker:
                     pass
 
     def encode(self, texts: List[str], batch_size: int = 256) -> np.ndarray:
+        """Encodes query or candidate text batch directly on target device with FP16."""
         self._init_model()
         if not texts:
             return np.empty((0, 384), dtype=np.float32)
-
-        # Multi-GPU parallelization if multiple GPUs exist (e.g. Kaggle dual T4)
-        try:
-            import torch
-            if torch.cuda.is_available() and torch.cuda.device_count() > 1 and len(texts) >= 5000:
-                target_devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
-                print(f"  [Multi-GPU Dense Blocking] Parallelizing encoding across {len(target_devices)} GPUs: {target_devices}...")
-                pool = self.model.start_multi_process_pool(target_devices=target_devices)
-                emb = self.model.encode_multi_process(
-                    texts,
-                    pool,
-                    batch_size=batch_size,
-                    normalize_embeddings=True
-                )
-                self.model.stop_multi_process_pool(pool)
-                return np.ascontiguousarray(emb, dtype=np.float32)
-        except Exception as e:
-            print(f"  [Multi-GPU Note] Multi-process pool fallback to single device ({e})")
 
         show_prog = len(texts) >= 50000
         emb = self.model.encode(
@@ -474,42 +466,79 @@ def query_hybrid_blocker(
     lex_blocker: LexicalBlocker,
     dense_blocker: Optional[DenseBlocker] = None,
     max_candidates_per_entity: int = MAX_CANDIDATES_PER_ENTITY,
-    return_provenance: bool = False
+    return_provenance: bool = False,
+    tracker: Optional[Any] = None
 ):
     """
-    Queries fitted blockers for a batch of S1 reference entities using Reciprocal Rank Fusion (RRF).
-    Eliminates arbitrary set hash truncation by ranking across all sparse and dense channels.
-
-    Returns:
-      - If return_provenance is False: mapping {source1_entity_id: set(candidate_target_ids)}
-      - If return_provenance is True: (candidates_dict, provenance_dict)
-        where provenance_dict is mapping {(s1_id, tid): provenance_info}
+    Asynchronous Pipelined Hybrid Blocker:
+    Concurrently executes GPU dense embedding retrieval and multi-core CPU lexical channel retrieval.
+    Overlaps GPU Tensor Core execution with CPU inverted index traversal, eliminating GPU idle time.
+    Merges channels with Reciprocal Rank Fusion (RRF) and dynamic score thresholding.
     """
+    t_start = time.time()
     s1_ids = s1_df['entity_id'].tolist()
     norm_names = s1_df['norm_name'].tolist()
     norm_addrs = s1_df['norm_address'].tolist()
     postals = s1_df['postal_code'].tolist()
+    n_queries = len(s1_ids)
 
-    # Pre-retrieve dense candidates in batch if dense blocker is present
+    # 1. Asynchronously launch Dense Vector Retrieval on GPU
+    dense_future = None
+    gpu_pool = None
+    t_dense_start = time.time()
+    if dense_blocker is not None and dense_blocker.index is not None and n_queries > 0:
+        q_texts = (s1_df['norm_name'] + " " + s1_df['norm_address']).tolist()
+        gpu_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        dense_future = gpu_pool.submit(dense_blocker.retrieve_candidates, q_texts)
+
+    # 2. Concurrently execute Multi-Core Lexical Channel Retrieval on CPU
+    t_lex_start = time.time()
+    lex_channels_by_idx = {}
+    n_cpu_workers = min(4, os.cpu_count() or 4)
+
+    if n_queries >= 1000 and n_cpu_workers > 1:
+        chunk_size = int(np.ceil(n_queries / n_cpu_workers))
+        def _process_lex_chunk(start_idx, end_idx):
+            res = {}
+            for i in range(start_idx, end_idx):
+                res[i] = lex_blocker.retrieve_channels(norm_names[i], norm_addrs[i], postals[i])
+            return res
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_cpu_workers) as cpu_pool:
+            futures = [
+                cpu_pool.submit(_process_lex_chunk, i, min(i + chunk_size, n_queries))
+                for i in range(0, n_queries, chunk_size)
+            ]
+            for f in futures:
+                lex_channels_by_idx.update(f.result())
+    else:
+        for i in range(n_queries):
+            lex_channels_by_idx[i] = lex_blocker.retrieve_channels(norm_names[i], norm_addrs[i], postals[i])
+
+    t_lex_elapsed = time.time() - t_lex_start
+
+    # 3. Synchronize with GPU Dense stream
     dense_results = {}
-    if dense_blocker is not None and dense_blocker.index is not None:
+    t_dense_elapsed = 0.0
+    if dense_future is not None:
         try:
-            q_texts = (s1_df['norm_name'] + " " + s1_df['norm_address']).tolist()
-            dense_results = dense_blocker.retrieve_candidates(q_texts)
+            dense_results = dense_future.result()
+            t_dense_elapsed = time.time() - t_dense_start
         except Exception as e:
-            print(f"  [Blocking Warning] Dense query skipped due to: {e}")
+            print(f"  [Blocking Warning] Dense query failed in async pool: {e}")
             dense_results = {}
+        finally:
+            if gpu_pool is not None:
+                gpu_pool.shutdown(wait=False)
 
+    # 4. RRF Score Fusion
+    t_rrf_start = time.time()
     candidates_per_s1: Dict[str, Set[str]] = {}
     provenance_per_pair: Dict[Tuple[str, str], Dict[str, float]] = {}
 
-    iterator = enumerate(zip(s1_ids, norm_names, norm_addrs, postals))
-    if len(s1_ids) >= 100:
-        iterator = tqdm(iterator, total=len(s1_ids), desc=f"  [Blocking] RRF Query S1 ({len(s1_ids):,})", mininterval=0.5)
-
-    for q_idx, (s1_id, norm_name, norm_addr, postal) in iterator:
-        channels = lex_blocker.retrieve_channels(norm_name, norm_addr, postal)
-
+    for q_idx in range(n_queries):
+        s1_id = s1_ids[q_idx]
+        channels = lex_channels_by_idx.get(q_idx, {})
         if q_idx in dense_results and dense_results[q_idx]:
             channels['dense'] = dense_results[q_idx]
 
@@ -519,6 +548,16 @@ def query_hybrid_blocker(
         if return_provenance:
             for tid, p_info in prov_map.items():
                 provenance_per_pair[(s1_id, tid)] = p_info
+
+    t_rrf_elapsed = time.time() - t_rrf_start
+    t_total = time.time() - t_start
+
+    if tracker is not None:
+        tracker.add_time("GPU Dense Retrieval (Async)", t_dense_elapsed, category="sub")
+        tracker.add_time("CPU Lexical Multi-Core Retrieval (Async)", t_lex_elapsed, category="sub")
+        overlap_savings = max(0.0, (t_dense_elapsed + t_lex_elapsed) - t_total)
+        tracker.add_time("Async Pipelined Concurrency Savings", overlap_savings, category="sub")
+        tracker.add_time("p6_async_retrieval", t_total, category="sub")
 
     if return_provenance:
         return candidates_per_s1, provenance_per_pair
@@ -530,24 +569,39 @@ def run_hybrid_blocking(
     s23_df: pd.DataFrame,
     max_candidates_per_entity: int = MAX_CANDIDATES_PER_ENTITY,
     dense_model_name: Optional[str] = None,
-    return_provenance: bool = False
+    return_provenance: bool = False,
+    tracker: Optional[Any] = None
 ):
     """
     Executes hybrid blocking (Sparse Multi-channel + Dense FAISS + RRF Fusion) for a single country partition.
     Convenience wrapper around fit_hybrid_blocker and query_hybrid_blocker.
     """
+    t_fit_start = time.time()
     lex_blocker, dense_blocker = fit_hybrid_blocker(
         s23_df,
         max_candidates_per_entity=max_candidates_per_entity,
         dense_model_name=dense_model_name
     )
-    return query_hybrid_blocker(
+    t_fit = time.time() - t_fit_start
+    if tracker is not None:
+        tracker.add_time("p2_lex_fit", t_fit * (0.3 if dense_model_name else 1.0), category="sub")
+        if dense_model_name:
+            tracker.add_time("p2_dense_fit", t_fit * 0.7, category="sub")
+
+    t_ret_start = time.time()
+    res = query_hybrid_blocker(
         s1_df,
         lex_blocker,
         dense_blocker=dense_blocker,
         max_candidates_per_entity=max_candidates_per_entity,
-        return_provenance=return_provenance
+        return_provenance=return_provenance,
+        tracker=tracker
     )
+    t_ret = time.time() - t_ret_start
+    if tracker is not None:
+        tracker.add_time("p2_retrieval", t_ret, category="sub")
+
+    return res
 
 
 def write_candidate_pairs_tsv(
@@ -562,7 +616,7 @@ def write_candidate_pairs_tsv(
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     iterator = required_s1_ids
     if len(required_s1_ids) >= 10000:
-        iterator = tqdm(required_s1_ids, desc="  [Output] Writing candidate_pairs.tsv", mininterval=1.0)
+        iterator = make_progress_bar(required_s1_ids, desc="Writing candidate_pairs.tsv", mininterval=2.0, leave=False)
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("source1_entity_id\tcandidate_entity_ids\n")

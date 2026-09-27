@@ -188,7 +188,7 @@ def extract_pairwise_features(
     return feats
 
 
-from tqdm import tqdm
+from logger import make_progress_bar
 
 
 def build_feature_matrix(
@@ -214,7 +214,7 @@ def build_feature_matrix(
 
     pair_iterator = candidate_pairs
     if len(candidate_pairs) >= 1000:
-        pair_iterator = tqdm(candidate_pairs, desc=f"  [Features] Extracting {len(candidate_pairs):,} Pairs", mininterval=0.5)
+        pair_iterator = make_progress_bar(candidate_pairs, desc=f"[Features] Extracting {len(candidate_pairs):,} Pairs", mininterval=2.0, leave=False)
 
     for s1_id, t_id in pair_iterator:
         if s1_id not in s1_lookup or t_id not in target_lookup:
@@ -253,9 +253,9 @@ def extract_features_and_score_chunked(
     total = len(candidate_pairs)
     feature_names = None
 
-    for start in tqdm(range(0, total, chunk_size),
-                      desc=f"  [Features+Score] Chunked ({total:,} pairs, {chunk_size//1000}K/chunk)",
-                      mininterval=1.0):
+    for start in make_progress_bar(range(0, total, chunk_size),
+                                   desc=f"[Features+Score] Chunked ({total:,} pairs, {chunk_size//1000}K/chunk)",
+                                   mininterval=2.0, leave=False):
         end = min(start + chunk_size, total)
         chunk_pairs = candidate_pairs[start:end]
 

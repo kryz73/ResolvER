@@ -245,7 +245,7 @@ def standardize_address(address: str, country: str) -> str:
     return re.sub(r'\s+', ' ', cleaned).strip()
 
 
-from tqdm import tqdm
+from logger import make_progress_bar
 
 
 def preprocess_dataframe(df: pd.DataFrame, is_reference: bool = False, drop_raw_columns: bool = False) -> pd.DataFrame:
@@ -262,7 +262,6 @@ def preprocess_dataframe(df: pd.DataFrame, is_reference: bool = False, drop_raw_
     If drop_raw_columns=True, drops the original 'business_name' and 'business_address'
     columns after preprocessing to free memory (~3GB on 10M-row DataFrames).
     """
-    df = df.copy()
     names = df['business_name'].fillna('').astype(str).tolist()
     addrs = df['business_address'].fillna('').astype(str).tolist()
     countries = df['country'].fillna('US').astype(str).tolist()
@@ -277,7 +276,7 @@ def preprocess_dataframe(df: pd.DataFrame, is_reference: bool = False, drop_raw_
     desc = "S1 Reference" if is_reference else "Targets"
     iterator = zip(names, addrs, countries)
     if len(names) >= 500:
-        iterator = tqdm(iterator, total=len(names), desc=f"  [Preprocessing] {desc} ({len(names):,})", mininterval=0.5)
+        iterator = make_progress_bar(iterator, total=len(names), desc=f"[Preprocessing] {desc} ({len(names):,})", mininterval=2.0, leave=False)
 
     for raw_name, raw_addr, c in iterator:
         is_missing = (not raw_addr) or (raw_addr.strip() == '') or (raw_addr.strip().lower() == 'nan')
