@@ -156,7 +156,9 @@ def main():
 
 
     # 4. Display Diagnostic Results in Kaggle / Colab
-    print("\n[Step 4/5] Pipeline Execution Summary & Diagnostics:")
+    print("\n" + "=" * 80)
+    print("STEP 4/5: PIPELINE EXECUTION HIGHLIGHTS & ARTIFACTS")
+    print("=" * 80)
     if Path("/kaggle/working").exists():
         log_base = Path("/kaggle/working/logs/kaggle_run")
     elif Path("/content").exists():
@@ -168,20 +170,32 @@ def main():
     if summary_file.exists():
         with open(summary_file, "r") as f:
             summary = json.load(f)
-        print("\n--- RUN SUMMARY ---")
-        print(json.dumps(summary, indent=2))
+        tm = summary.get("threshold_metrics", {})
+        bm = summary.get("blocking_metrics", {})
+        runtime_s = summary.get("total_runtime_seconds", 0.0)
+
+        print(f"  * Validation Macro F0.5:   {tm.get('validation_macro_f05', 'N/A')}")
+        print(f"  * Optimal Thresholds:      tau = {tm.get('optimal_tau', 'N/A')} | singleton_tau = {tm.get('optimal_singleton_tau', 'N/A')}")
+        if bm:
+            print(f"  * Blocking Recall (PC):    {bm.get('pair_completeness', 'N/A')}% (Avg cands: {bm.get('candidates_per_entity', 'N/A')})")
+        print(f"  * Total Runtime:           {runtime_s:.2f}s ({runtime_s/60.0:.2f}m)")
+
+    timing_file = log_base / "timing_summary.csv"
+    if timing_file.exists():
+        print(f"  * Timing Summary Table:    Saved to {timing_file}")
 
     feat_file = log_base / "feature_importance.csv"
     if feat_file.exists():
-        f_df = pd.read_csv(feat_file)
-        print("\n--- TOP 15 FEATURE IMPORTANCES ---")
-        print(f_df.head(15).to_string(index=False))
+        print(f"  * Feature Importances:     Saved to {feat_file} (Full features)")
 
     fp_file = log_base / "error_analysis_false_positives.csv"
     if fp_file.exists():
-        fp_df = pd.read_csv(fp_file)
-        print(f"\n--- TOP FALSE POSITIVES (Total: {len(fp_df)}) ---")
-        print(fp_df[['s1_id', 'target_id', 'prob', 's1_name', 'target_name']].head(5).to_string(index=False))
+        print(f"  * Error Diagnostics:       Saved to {fp_file} and error_analysis_false_negatives.csv")
+
+    log_path = log_base / "pipeline.log"
+    if log_path.exists():
+        print(f"  * Detailed Execution Log:  {log_path}")
+    print("=" * 80)
 
     # 5. Packaging Submission Files According to Guidelines
     if not args.skip_test and (OUTPUT_MATCHING_PATH.exists() or OUTPUT_CANDIDATE_PATH.exists()):
