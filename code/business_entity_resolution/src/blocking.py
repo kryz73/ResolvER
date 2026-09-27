@@ -20,6 +20,7 @@ try:
     import faiss
 except ImportError:
     faiss = None
+    print("  [WARNING] faiss not installed — dense blocking will be disabled. Install with: pip install faiss-cpu (or faiss-gpu-cu12 for GPU)")
 
 # Guarded 2-letter tokens exclusion set (common prepositions, units, indicators)
 STOP_2LETTER = {
@@ -315,7 +316,7 @@ class DenseBlocker:
                 except Exception:
                     pass
 
-    def encode(self, texts: List[str], batch_size: int = 256) -> np.ndarray:
+    def encode(self, texts: List[str], batch_size: int = 64) -> np.ndarray:
         """Encodes query or candidate text batch directly on target device with FP16."""
         self._init_model()
         if not texts:
@@ -331,12 +332,14 @@ class DenseBlocker:
         )
         return np.ascontiguousarray(emb, dtype=np.float32)
 
-    def fit(self, target_df: pd.DataFrame, batch_size: int = 256, chunk_size: int = 100_000):
+    def fit(self, target_df: pd.DataFrame, batch_size: int = 64, chunk_size: int = 100_000):
         """
         Encodes target records in memory-safe chunks and builds FAISS index.
         Prevents IPC memory duplication and Linux OOM kills on massive datasets.
+        Automatically selects memory-bounded index (IVFFlat) when flat index would exceed RAM.
         """
         if faiss is None or target_df is None or len(target_df) == 0:
+            print("  [Dense Blocker] Skipped — faiss not available or empty target DataFrame.")
             return
 
         self._init_model()
@@ -344,7 +347,23 @@ class DenseBlocker:
         n_targets = len(target_df)
 
         dim = self.model.get_sentence_embedding_dimension() if hasattr(self.model, "get_sentence_embedding_dimension") else 1024
-        self.index = faiss.IndexFlatIP(dim)
+
+        # Memory-bounded FAISS index selection:
+        # IndexFlatIP stores all vectors in RAM: n_targets * dim * 4 bytes
+        estimated_index_bytes = n_targets * dim * 4
+        max_flat_bytes = 20 * (1024 ** 3)  # 20 GB threshold
+
+        use_ivf = estimated_index_bytes > max_flat_bytes
+        if use_ivf:
+            # IVF index: approximate search with clustering, much lower memory
+            n_clusters = min(int(np.sqrt(n_targets)), 4096)
+            quantizer = faiss.IndexFlatIP(dim)
+            self.index = faiss.IndexIVFFlat(quantizer, dim, n_clusters, faiss.METRIC_INNER_PRODUCT)
+            self.index.nprobe = min(32, n_clusters)
+            print(f"  [Dense Blocker] Using IndexIVFFlat ({n_clusters} clusters, nprobe={self.index.nprobe}) — flat index would require {estimated_index_bytes / (1024**3):.1f} GB RAM")
+        else:
+            self.index = faiss.IndexFlatIP(dim)
+            print(f"  [Dense Blocker] Using IndexFlatIP — estimated {estimated_index_bytes / (1024**3):.1f} GB RAM")
 
         # Multi-GPU pool initialization if multiple GPUs exist
         pool = None
@@ -361,6 +380,21 @@ class DenseBlocker:
         n_chunks = int(np.ceil(n_targets / chunk_size))
         print(f"  [Dense Blocker] Indexing {n_targets:,} targets in {n_chunks} chunk(s) of {chunk_size:,}...")
 
+        # Collect all embeddings for IVF training (need a sample for clustering)
+        training_sample = None
+        if use_ivf:
+            # Collect a representative sample for IVF training
+            max_train_samples = min(n_targets, 100_000)
+            sample_indices = np.random.RandomState(42).choice(n_targets, size=max_train_samples, replace=False)
+            sample_slice = target_df.iloc[sample_indices]
+            sample_texts = (sample_slice['norm_name'] + " " + sample_slice['norm_address']).tolist()
+            del sample_slice
+            training_sample = self.encode(sample_texts, batch_size=batch_size)
+            del sample_texts
+            print(f"  [Dense Blocker] Training IVF index on {len(training_sample):,} sample vectors...")
+            self.index.train(training_sample)
+            del training_sample
+
         import gc
         for c_idx in range(n_chunks):
             start_i = c_idx * chunk_size
@@ -371,12 +405,15 @@ class DenseBlocker:
 
             if pool is not None:
                 try:
+                    # Bug 1 Fix: encode_multi_process does NOT accept normalize_embeddings
                     chunk_embs = self.model.encode_multi_process(
                         chunk_texts,
                         pool,
-                        batch_size=batch_size,
-                        normalize_embeddings=True
+                        batch_size=batch_size
                     )
+                    # Manual L2 normalization since encode_multi_process doesn't support it
+                    norms = np.linalg.norm(chunk_embs, axis=1, keepdims=True)
+                    chunk_embs = chunk_embs / np.maximum(norms, 1e-12)
                 except Exception as e:
                     print(f"  [Multi-GPU Pool Warning] Chunk {c_idx+1} fallback ({e}).")
                     chunk_embs = self.model.encode(
@@ -410,7 +447,9 @@ class DenseBlocker:
             del pool
             gc.collect()
 
-    def retrieve_candidates(self, query_texts: List[str], batch_size: int = 256) -> Dict[int, List[Tuple[str, float]]]:
+        print(f"  [Dense Blocker] Index built: {self.index.ntotal:,} vectors indexed.")
+
+    def retrieve_candidates(self, query_texts: List[str], batch_size: int = 64) -> Dict[int, List[Tuple[str, float]]]:
         """Performs batch vector query and returns candidates with their raw cosine similarity scores."""
         if self.index is None or faiss is None or not query_texts:
             return {}
@@ -455,8 +494,12 @@ def fit_hybrid_blocker(
             dense_blocker = DenseBlocker(model_name=dense_model_name, max_candidates=25)
             dense_blocker.fit(s23_df)
         except Exception as e:
-            print(f"  [Blocking Warning] Dense blocker init skipped due to: {e}")
+            print(f"  [Blocking WARNING] Dense blocker init FAILED: {type(e).__name__}: {e}")
             dense_blocker = None
+    elif dense_model_name and faiss is None:
+        print(f"  [Blocking WARNING] Dense model requested ({dense_model_name}) but faiss is not installed — running lexical-only blocking!")
+    else:
+        print(f"  [Blocking] Dense blocking not requested — running lexical-only blocking.")
 
     return lex_blocker, dense_blocker
 

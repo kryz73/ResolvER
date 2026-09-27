@@ -252,15 +252,31 @@ def run_pipeline(
             s1_c = s1_train_proc[s1_train_proc['country'] == country]
             s23_c = s23_train_proc[s23_train_proc['country'] == country]
             tracker.log(f"  Blocking country [{country}]: {len(s1_c):,} S1 against {len(s23_c):,} targets...")
-            c_dict, prov_dict = run_hybrid_blocking(
-                s1_c, s23_c,
+
+            # Fit blockers once per country
+            lex_blocker, dense_blocker = fit_hybrid_blocker(
+                s23_c,
                 max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY,
-                dense_model_name=dense_model,
-                return_provenance=True,
-                tracker=tracker
+                dense_model_name=dense_model
             )
-            all_candidates.update(c_dict)
-            train_provenance.update(prov_dict)
+
+            # Bug 6 Fix: Batch S1 queries in 50k chunks to prevent memory explosion with dense encoding
+            s1_batch_size = 50_000
+            n_s1 = len(s1_c)
+            for b_start in range(0, n_s1, s1_batch_size):
+                b_end = min(b_start + s1_batch_size, n_s1)
+                batch_s1 = s1_c.iloc[b_start:b_end]
+                c_dict, prov_dict = query_hybrid_blocker(
+                    batch_s1, lex_blocker, dense_blocker=dense_blocker,
+                    max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY,
+                    return_provenance=True,
+                    tracker=tracker
+                )
+                all_candidates.update(c_dict)
+                train_provenance.update(prov_dict)
+
+            del lex_blocker, dense_blocker
+            import gc; gc.collect()
     
         # Evaluate Blocking Performance (Pair Completeness & Reduction Ratio)
         total_true_matches = sum(len(gt_train.get(sid, set())) for sid in s1_train_ids)
@@ -668,6 +684,8 @@ def run_pipeline(
 def run_loco_evaluation(
     sample_size: Optional[int] = None,
     device: str = "cpu",
+    use_dense: bool = False,
+    dense_model_name: str = SBERT_MODEL_NAME,
     log_dir: str = "logs",
     experiment_name: Optional[str] = "loco_france_proxy"
 ):
@@ -739,10 +757,14 @@ def run_loco_evaluation(
     s23_us = s23_proc[s23_proc['country'] == 'US']
     s23_in = s23_proc[s23_proc['country'] == 'India']
 
+    dense_model = dense_model_name if use_dense else None
+    if device == "cuda":
+        os.environ["USE_GPU"] = "1"
+
     tracker.log("Blocking US training entities...")
-    us_cands = run_hybrid_blocking(s1_us_proc, s23_us, max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY)
+    us_cands = run_hybrid_blocking(s1_us_proc, s23_us, max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY, dense_model_name=dense_model)
     tracker.log("Blocking India validation entities...")
-    in_cands = run_hybrid_blocking(s1_in_proc, s23_in, max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY)
+    in_cands = run_hybrid_blocking(s1_in_proc, s23_in, max_candidates_per_entity=MAX_CANDIDATES_PER_ENTITY, dense_model_name=dense_model)
     tracker.stop_timer("loco_blocking")
 
     # 3. Features & Train on US

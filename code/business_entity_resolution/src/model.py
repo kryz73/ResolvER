@@ -118,15 +118,21 @@ class SelectiveCrossEncoderReranker:
     Multilingual Cross-Encoder (BAAI/bge-reranker-v2-m3) that scores candidate pairs
     selectively on the ambiguous tail (e.g. 0.35 <= prob <= 0.75 or top-K).
     Accelerated with CUDA and FP16 when GPU is present (e.g. Kaggle T4 GPU).
+    Loads on cuda:1 by default to avoid VRAM conflict with dense blocker on cuda:0.
     """
-    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", top_k: int = 1, batch_size: int = 128):
+    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", top_k: int = 1, batch_size: int = 64):
         self.model_name = model_name
         self.top_k = top_k
         self.batch_size = batch_size
         self.model = None
         try:
             import torch
-            self.device = "cuda" if (torch.cuda.is_available() and os.environ.get("USE_GPU", "1") == "1") else "cpu"
+            if torch.cuda.is_available() and os.environ.get("USE_GPU", "1") == "1":
+                # Prefer cuda:1 to avoid VRAM conflict with dense blocker on cuda:0
+                n_gpus = torch.cuda.device_count()
+                self.device = f"cuda:{n_gpus - 1}" if n_gpus > 1 else "cuda:0"
+            else:
+                self.device = "cpu"
         except Exception:
             self.device = "cpu"
         self._init_model()
@@ -136,13 +142,14 @@ class SelectiveCrossEncoderReranker:
             try:
                 from sentence_transformers import CrossEncoder
                 self.model = CrossEncoder(self.model_name, max_length=256, device=self.device)
-                if self.device == "cuda" and hasattr(self.model, "model"):
+                if "cuda" in self.device and hasattr(self.model, "model"):
                     try:
                         self.model.model = self.model.model.half()
                     except Exception:
                         pass
+                print(f"  [Reranker] Loaded {self.model_name} on {self.device}")
             except Exception as e:
-                print(f"  [Reranker Note] CrossEncoder init skipped or unavailable ({e}).")
+                print(f"  [Reranker WARNING] CrossEncoder init FAILED: {type(e).__name__}: {e}")
                 self.model = None
 
     def rerank_pairs(self, text_pairs: List[Tuple[str, str]]) -> np.ndarray:
@@ -150,17 +157,43 @@ class SelectiveCrossEncoderReranker:
         self._init_model()
         if self.model is None or not text_pairs:
             return np.zeros(len(text_pairs), dtype=np.float32)
+
+        # Bug 4 Fix: CrossEncoder.predict() expects list of [str, str] lists, not tuples
+        formatted_pairs = [[str(a), str(b)] for a, b in text_pairs]
+
         try:
             scores = self.model.predict(
-                text_pairs,
+                formatted_pairs,
                 batch_size=self.batch_size,
-                show_progress_bar=(len(text_pairs) >= 5000)
+                show_progress_bar=(len(formatted_pairs) >= 5000)
             )
             # Normalize logits via sigmoid
             probs = 1.0 / (1.0 + np.exp(-np.clip(scores, -15.0, 15.0)))
             return np.ascontiguousarray(probs, dtype=np.float32)
+        except RuntimeError as e:
+            # CUDA OOM — retry with smaller batch size
+            if "out of memory" in str(e).lower():
+                import gc, torch
+                torch.cuda.empty_cache()
+                gc.collect()
+                fallback_bs = max(8, self.batch_size // 4)
+                print(f"  [Reranker] CUDA OOM — retrying with batch_size={fallback_bs}...")
+                try:
+                    scores = self.model.predict(
+                        formatted_pairs,
+                        batch_size=fallback_bs,
+                        show_progress_bar=False
+                    )
+                    probs = 1.0 / (1.0 + np.exp(-np.clip(scores, -15.0, 15.0)))
+                    return np.ascontiguousarray(probs, dtype=np.float32)
+                except Exception as e2:
+                    print(f"  [Reranker ERROR] Retry also failed: {type(e2).__name__}: {e2}")
+                    return np.zeros(len(text_pairs), dtype=np.float32)
+            else:
+                print(f"  [Reranker ERROR] Pair prediction failed: {type(e).__name__}: {e}")
+                return np.zeros(len(text_pairs), dtype=np.float32)
         except Exception as e:
-            print(f"  [Reranker Error] Pair prediction failed: {e}")
+            print(f"  [Reranker ERROR] Pair prediction failed: {type(e).__name__}: {e}")
             return np.zeros(len(text_pairs), dtype=np.float32)
 
 

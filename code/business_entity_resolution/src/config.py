@@ -18,25 +18,36 @@ def detect_dataset_root() -> Path:
     if "DATASET_ROOT" in os.environ and Path(os.environ["DATASET_ROOT"]).exists():
         return Path(os.environ["DATASET_ROOT"])
 
-    kaggle_input = Path("/kaggle/input")
-    if kaggle_input.exists():
-        for p in kaggle_input.rglob("train_source1.tsv"):
-            return p.parent.parent  # parent is 'train', grandparent is 'dataset'
-
-    # Google Colab detection: check local /content (fast SSD) and /content/drive
-    colab_dir = Path("/content")
-    if colab_dir.exists():
-        for p in colab_dir.rglob("train_source1.tsv"):
-            return p.parent.parent
-
-    local_path = Path("/home/kryz/dev/amazon/6ab10eb3b23ba_student_resource/student_resource/dataset")
-    if local_path.exists():
-        return local_path
-
-    # Current working directory fallbacks
-    for cand in [Path("./dataset"), Path("../dataset"), Path("../../dataset")]:
-        if cand.exists():
+    # Explicit direct paths first
+    direct_candidates = [
+        Path("/kaggle/input"),
+        Path("/content/dataset"),
+        Path("/content/student_resource/dataset"),
+        Path("/content/tea-ml/student_resource/dataset"),
+        Path("/content/tea-ml/6ab10eb3b23ba_student_resource/student_resource/dataset"),
+        Path("/content/tea-ml/dataset"),
+        Path("/home/kryz/dev/amazon/6ab10eb3b23ba_student_resource/student_resource/dataset"),
+        Path("/home/kryz/dev/amazon/student_resource/dataset"),
+        Path("/home/kryz/dev/amazon/dataset"),
+        Path("./dataset"),
+        Path("../dataset"),
+        Path("../../dataset"),
+        Path("../../../dataset")
+    ]
+    for cand in direct_candidates:
+        if (cand / "train" / "train_source1.tsv").exists() or (cand / "train_source1.tsv").exists():
             return cand.resolve()
+
+    # Search in Kaggle / Colab
+    for search_root in [Path("/kaggle/input"), Path("/content")]:
+        if search_root.exists():
+            try:
+                for p in search_root.rglob("train_source1.tsv"):
+                    if p.parent.name == "train":
+                        return p.parent.parent
+                    return p.parent
+            except Exception:
+                pass
 
     return Path("./dataset")
 
@@ -84,30 +95,63 @@ def find_file(filename: str, fallback_path: Path) -> Path:
     """Finds a file recursively in DATASET_ROOT, /kaggle/input, /content, or local directories."""
     if fallback_path.exists():
         return fallback_path
+
+    # Search in environment override first
     if "DATASET_ROOT" in os.environ:
-        root = Path(os.environ["DATASET_ROOT"])
-        for p in root.rglob(filename):
-            return p
-    kaggle_input = Path("/kaggle/input")
-    if kaggle_input.exists():
-        for p in kaggle_input.rglob(filename):
-            return p
-    colab_dir = Path("/content")
-    if colab_dir.exists():
-        for p in colab_dir.rglob(filename):
-            return p
-        if (root / filename).exists():
-            return root / filename
-        for p in root.rglob(filename):
-            return p
-    kaggle_input = Path("/kaggle/input")
-    if kaggle_input.exists():
-        for p in kaggle_input.rglob(filename):
-            return p
-    for cand in [Path("."), Path("../.."), Path("/home/kryz/dev/amazon")]:
-        if cand.exists():
-            for p in cand.rglob(filename):
+        env_root = Path(os.environ["DATASET_ROOT"])
+        if (env_root / filename).exists():
+            return env_root / filename
+        if (env_root / "train" / filename).exists():
+            return env_root / "train" / filename
+        if (env_root / "test" / filename).exists():
+            return env_root / "test" / filename
+        try:
+            for p in env_root.rglob(filename):
                 return p
+        except Exception:
+            pass
+
+    # Direct checks in common candidate directories
+    candidate_dirs = [
+        Path("/kaggle/input"),
+        Path("/content/dataset"),
+        Path("/content/student_resource/dataset"),
+        Path("/content/tea-ml/student_resource/dataset"),
+        Path("/content/tea-ml/6ab10eb3b23ba_student_resource/student_resource/dataset"),
+        Path("/content/tea-ml/dataset"),
+        Path("/content"),
+        Path("/home/kryz/dev/amazon/6ab10eb3b23ba_student_resource/student_resource/dataset"),
+        Path("/home/kryz/dev/amazon/student_resource/dataset"),
+        Path("/home/kryz/dev/amazon/dataset"),
+        Path("./dataset"),
+        Path("../dataset"),
+        Path("../../dataset"),
+        Path("../../../dataset"),
+        Path("."),
+        Path(".."),
+        Path("../..")
+    ]
+
+    for c_dir in candidate_dirs:
+        if c_dir.exists():
+            if (c_dir / filename).exists():
+                return c_dir / filename
+            if (c_dir / "train" / filename).exists():
+                return c_dir / "train" / filename
+            if (c_dir / "test" / filename).exists():
+                return c_dir / "test" / filename
+            if (c_dir / "utils" / filename).exists():
+                return c_dir / "utils" / filename
+
+    # Broad search in Kaggle / Colab roots
+    for broad_root in [Path("/kaggle/input"), Path("/content")]:
+        if broad_root.exists():
+            try:
+                for p in broad_root.rglob(filename):
+                    return p
+            except Exception:
+                pass
+
     return fallback_path
 
 
@@ -136,6 +180,10 @@ TEST_S3_PATH = find_file("test_source3.tsv", TEST_DIR / "test_source3.tsv")
 # If TEST_S1_PATH was found, make sure TEST_DIR points to its directory for the validator
 if TEST_S1_PATH.exists():
     TEST_DIR = TEST_S1_PATH.parent
+if TRAIN_S1_PATH.exists():
+    TRAIN_DIR = TRAIN_S1_PATH.parent
+    if not DATASET_ROOT.exists():
+        DATASET_ROOT = TRAIN_DIR.parent if TRAIN_DIR.name == "train" else TRAIN_DIR
 
 OUTPUT_MATCHING_PATH = OUTPUT_DIR / "matching_results.tsv"
 OUTPUT_CANDIDATE_PATH = OUTPUT_DIR / "candidate_pairs.tsv"

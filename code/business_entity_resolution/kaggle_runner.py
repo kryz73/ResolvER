@@ -66,8 +66,8 @@ def main():
     parser.add_argument("--sample-size", type=str, default=None,
                         help="Train sample size (int like 220000, or float like 0.1 for 10% of dataset)")
     parser.add_argument("--use-dense", action="store_true", help="Enable dense multilingual embedding blocking")
-    parser.add_argument("--dense-model", type=str, default="BAAI/bge-m3",
-                        help="HuggingFace model for dense blocking (default: 'BAAI/bge-m3', fast alternative: 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')")
+    parser.add_argument("--dense-model", type=str, default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                        help="HuggingFace model for dense blocking (default: 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2', high-quality alternative: 'BAAI/bge-m3')")
     parser.add_argument("--skip-test", action="store_true", help="Skip test set inference (useful for fast cross-validation diagnostics)")
     parser.add_argument("--test-only", action="store_true", help="Skip training and run inference using existing saved model checkpoint")
     parser.add_argument("--model-checkpoint", type=str, default=None, help="Path to saved model checkpoint (.pkl)")
@@ -84,8 +84,20 @@ def main():
             import faiss
             import sentence_transformers
         except ImportError:
-            print("\n[Step 1b/5] Installing neural NLP dependencies (faiss-cpu, sentence-transformers)...")
-            run_cmd(f"{sys.executable} -m pip install -q faiss-cpu sentence-transformers")
+            # Smart FAISS installation: prefer faiss-gpu when GPU is available
+            print("\n[Step 1b/5] Installing neural NLP dependencies...")
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    print("  GPU detected — installing faiss-gpu-cu12 for GPU-accelerated FAISS...")
+                    rc = run_cmd(f"{sys.executable} -m pip install -q faiss-gpu-cu12 sentence-transformers")
+                    if rc != 0:
+                        print("  faiss-gpu-cu12 failed, falling back to faiss-cpu...")
+                        run_cmd(f"{sys.executable} -m pip install -q faiss-cpu sentence-transformers")
+                else:
+                    run_cmd(f"{sys.executable} -m pip install -q faiss-cpu sentence-transformers")
+            except ImportError:
+                run_cmd(f"{sys.executable} -m pip install -q faiss-cpu sentence-transformers")
 
     # Check for GPU
     try:
@@ -125,6 +137,8 @@ def main():
         run_loco_evaluation(
             sample_size=sample_val,
             device=device,
+            use_dense=args.use_dense,
+            dense_model_name=args.dense_model,
             log_dir=log_dir,
             experiment_name="kaggle_run"
         )
