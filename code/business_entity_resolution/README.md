@@ -71,45 +71,52 @@ Ensure the dataset directory follows the competition layout:
 
 ## 3. Running the Pipeline
 
-All execution is managed through `code/business_entity_resolution/src/pipeline.py`.
+All execution across all platforms (Local Workstation, Google Colab, Kaggle, Cloud GPU instances) is managed through the unified entry point **`run.py`** (with `main.py` and `kaggle_runner.py` provided as direct aliases).
 
-### A. Full Cloud GPU Execution (Train + Test Inference + Validation)
-This runs the full end-to-end pipeline across all 12.5M train records and 11.7M test records using GPU acceleration:
+### A. Recommended Cloud GPU Run (Colab / Kaggle / Cloud)
+Trains on 50,000 entities (or `--sample-size 0.1` for 10%), enables multilingual FAISS dense blocking, evaluates 5-fold CV, optimizes decision thresholds, runs test inference, and packages official submissions:
 
 ```bash
-cd code/business_entity_resolution/src
-python3 pipeline.py --test --device cuda --use-dense
+cd code/business_entity_resolution
+python3 run.py --sample-size 50000 --use-dense --team-name tea_ml
 ```
 
-### B. Fast Cloud Validation Benchmark (50,000 Entities)
-To run a fast validation check, train on 50k entities, evaluate 5-fold CV, and log metrics:
-
+### B. High-Speed MiniLM Option (<1 min vector encoding)
 ```bash
-cd code/business_entity_resolution/src
-python3 pipeline.py --sample-size 50000 --device cuda
+python3 run.py --sample-size 50000 --use-dense --dense-model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 ```
 
-### C. Local CPU Mode
-To test locally on CPU:
-
+### C. Full Neural Stack (Dense Blocking + Ambiguous Tail Reranking)
 ```bash
-cd code/business_entity_resolution/src
-python3 pipeline.py --sample-size 1000 --device cpu
+python3 run.py --sample-size 50000 --use-dense --use-reranker
+```
+
+### D. Fast Cross-Validation Diagnostics Only (Skip Test Inference)
+```bash
+python3 run.py --sample-size 50000 --skip-test
+```
+
+### E. Test-Only Inference from Saved Model Checkpoint
+```bash
+python3 run.py --test-only --model-checkpoint logs/pipeline_run/matcher_model.pkl
 ```
 
 ---
 
-## 4. CLI Argument Reference
+## 4. CLI Argument Reference (`run.py` / `main.py`)
 
 | Flag | Type | Default | Description |
 |:---|:---:|:---:|:---|
-| `--test` | Flag | `False` | When passed, executes test inference and generates final submission TSVs. |
-| `--device` | String | `cpu` | Compute device: `cuda` (for Cloud GPU) or `cpu`. |
+| `--sample-size` | Int / Float | `None` | Sample size: integer (e.g. `50000`) or float fraction (e.g. `0.1` for 10%). Unset for full dataset. |
 | `--use-dense` | Flag | `False` | Enables dense multilingual embedding blocking (FAISS). |
-| `--dense-model` | String | `paraphrase-multilingual-MiniLM-L12-v2` | HuggingFace multilingual embedding model. |
-| `--sample-size` | Int | `None` | Number of S1 training entities (leave unset for full cloud dataset). |
-| `--log-dir` | String | `logs` | Root directory for experiment runs and diagnostic tables. |
-| `--exp-name` | String | `None` | Custom identifier for the experiment run. |
+| `--dense-model` | String | `paraphrase-multilingual-MiniLM-L12-v2` | Embedding model (`MiniLM-L12-v2` or `BAAI/bge-m3`). |
+| `--use-reranker` | Flag | `False` | Enables multilingual cross-encoder reranking on ambiguous predictions. |
+| `--skip-test` | Flag | `False` | Skip test set inference (evaluation & threshold tuning only). |
+| `--test-only` | Flag | `False` | Skip training and run inference using a pre-trained model checkpoint. |
+| `--model-checkpoint` | String | `None` | Path to saved model checkpoint `.pkl`. |
+| `--tau` | Float | `None` | Custom classification threshold (overrides auto-tuned threshold). |
+| `--tau-singleton` | Float | `None` | Custom singleton guardrail threshold. |
+| `--team-name` | String | `tea_ml` | Team name used to package the final `<team_name>_submission.zip`. |
 
 ---
 
