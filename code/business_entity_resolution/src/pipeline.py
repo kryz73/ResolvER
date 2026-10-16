@@ -66,7 +66,7 @@ def run_pipeline(
 ):
     tracker = ExperimentTracker(log_dir=log_dir, experiment_name=experiment_name)
     tracker.log("=" * 80)
-    tracker.log("2026 AMAZON BUSINESS ENTITY RESOLUTION — HYBRID PIPELINE (APPROACH 4)")
+    tracker.log("ResolvER: HYBRID BUSINESS ENTITY RESOLUTION PIPELINE")
     tracker.log("=" * 80)
 
     # Set GPU environment flag

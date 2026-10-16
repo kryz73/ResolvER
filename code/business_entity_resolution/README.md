@@ -1,8 +1,8 @@
-# 2026 Amazon Business Entity Resolution — Approach 4 Pipeline
+# ResolvER: Large-Scale Multilingual Business Entity Resolution
 
-Production implementation of the **Dual Sparse-Dense Hybrid Pipeline (Approach 4)** for the **2026 Amazon Business Entity Resolution Challenge**. 
+Production-grade implementation of **ResolvER** (Dual Sparse-Dense Hybrid Architecture) for the **2026 Amazon Business Entity Resolution Challenge**. 
 
-This system resolves ~1.73M reference entities (Source 1) against ~9.97M noisy target entities (Sources 2 and 3) across the **United States**, **India**, and **France** (zero-shot transfer), directly optimizing the **Macro $F_{0.5}$** evaluation metric.
+ResolvER resolves ~1.73M reference entities (Source 1) against ~9.97M noisy target entities (Sources 2 and 3) across the **United States**, **India**, and **France** (zero-shot cross-border transfer), directly optimizing the **Macro $F_{0.5}$** competition evaluation metric.
 
 ---
 

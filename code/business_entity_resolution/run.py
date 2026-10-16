@@ -1,6 +1,6 @@
 """
-ML Challenge 2026 — Business Entity Resolution
-Unified Pipeline Runner (Local Workstation, Google Colab, Kaggle, Cloud GPU)
+ResolvER — Large-Scale Multilingual Business Entity Resolution Pipeline
+Unified Runner (Local Workstation, Google Colab, Kaggle, Cloud GPU)
 
 Auto-configures runtime environment, installs dependencies if missing,
 executes Approach 4 Dual Sparse-Dense Hybrid Pipeline, and packages official
@@ -18,17 +18,17 @@ import json
 
 
 def run_cmd(cmd: str):
-    print(f"\n[Pipeline Runner] Running: {cmd}")
+    print(f"\n[ResolvER Runner] Running: {cmd}")
     res = subprocess.run(cmd, shell=True)
     if res.returncode != 0:
-        print(f"[Pipeline Runner Warning] Command exited with code: {res.returncode}")
+        print(f"[ResolvER Warning] Command exited with code: {res.returncode}")
     return res.returncode
 
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Unified Pipeline Runner for Amazon Business Entity Resolution (Local, Colab, Kaggle, Cloud)"
+        description="ResolvER — Unified Pipeline Runner for Amazon Business Entity Resolution (Local, Colab, Kaggle, Cloud)"
     )
     parser.add_argument("--mode", type=str, default="standard", choices=["standard", "loco_check"],
                         help="Execution mode: 'standard' or 'loco_check' (Leave-One-Country-Out France proxy)")
@@ -48,7 +48,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 80)
-    print("2026 AMAZON BUSINESS ENTITY RESOLUTION — UNIFIED PIPELINE RUNNER")
+    print("ResolvER: 2026 AMAZON BUSINESS ENTITY RESOLUTION PIPELINE")
     print("=" * 80)
 
     # 1. Install necessary dependencies if missing (Colab / Kaggle auto-setup)
