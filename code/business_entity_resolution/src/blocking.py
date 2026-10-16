@@ -310,26 +310,31 @@ class DenseBlocker:
             except Exception:
                 pass
 
-            if self.device == "cuda":
-                try:
-                    self.model = self.model.half()
-                except Exception:
-                    pass
-
     def encode(self, texts: List[str], batch_size: int = 64) -> np.ndarray:
-        """Encodes query or candidate text batch directly on target device with FP16."""
+        """Encodes query or candidate text batch directly on target device with FP16 autocast."""
         self._init_model()
         if not texts:
             return np.empty((0, 384), dtype=np.float32)
 
         show_prog = len(texts) >= 50000
-        emb = self.model.encode(
-            texts,
-            batch_size=batch_size,
-            show_progress_bar=show_prog,
-            normalize_embeddings=True,
-            device=self.device
-        )
+        if "cuda" in self.device:
+            import torch
+            with torch.amp.autocast("cuda"):
+                emb = self.model.encode(
+                    texts,
+                    batch_size=batch_size,
+                    show_progress_bar=show_prog,
+                    normalize_embeddings=True,
+                    device=self.device
+                )
+        else:
+            emb = self.model.encode(
+                texts,
+                batch_size=batch_size,
+                show_progress_bar=show_prog,
+                normalize_embeddings=True,
+                device=self.device
+            )
         return np.ascontiguousarray(emb, dtype=np.float32)
 
     def fit(self, target_df: pd.DataFrame, batch_size: int = 64, chunk_size: int = 100_000):

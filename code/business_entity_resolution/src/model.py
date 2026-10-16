@@ -116,11 +116,12 @@ class AsymmetricEntityMatcher:
 class SelectiveCrossEncoderReranker:
     """
     Multilingual Cross-Encoder (BAAI/bge-reranker-v2-m3) that scores candidate pairs
-    selectively on the ambiguous tail (e.g. 0.35 <= prob <= 0.75 or top-K).
-    Accelerated with CUDA and FP16 when GPU is present (e.g. Kaggle T4 GPU).
+    selectively on the ambiguous tail (e.g. 0.46 <= prob <= 0.56 or top-K).
+    Accelerated with CUDA and FP16 via torch.amp.autocast when GPU is present.
     Loads on cuda:1 by default to avoid VRAM conflict with dense blocker on cuda:0.
+    Uses FP32 weights with runtime autocast to prevent LayerNormKernelImpl crash on XLM-RoBERTa.
     """
-    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", top_k: int = 1, batch_size: int = 64):
+    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", top_k: int = 1, batch_size: int = 32):
         self.model_name = model_name
         self.top_k = top_k
         self.batch_size = batch_size
@@ -141,15 +142,13 @@ class SelectiveCrossEncoderReranker:
         if self.model is None:
             try:
                 from sentence_transformers import CrossEncoder
+                # Initialize in standard FP32 - NEVER call model.half() directly
+                # because XLM-RoBERTa LayerNorm crashes with "LayerNormKernelImpl not implemented for Half"
                 self.model = CrossEncoder(self.model_name, max_length=256, device=self.device)
-                if "cuda" in self.device and hasattr(self.model, "model"):
-                    try:
-                        self.model.model = self.model.model.half()
-                    except Exception:
-                        pass
-                print(f"  [Reranker] Loaded {self.model_name} on {self.device}")
+                print(f"  [Reranker] Successfully loaded {self.model_name} on {self.device}")
             except Exception as e:
-                print(f"  [Reranker WARNING] CrossEncoder init FAILED: {type(e).__name__}: {e}")
+                import traceback
+                print(f"  [Reranker WARNING] CrossEncoder init FAILED: {type(e).__name__}: {e}\n{traceback.format_exc()}")
                 self.model = None
 
     def rerank_pairs(self, text_pairs: List[Tuple[str, str]]) -> np.ndarray:
@@ -159,41 +158,58 @@ class SelectiveCrossEncoderReranker:
             return np.zeros(len(text_pairs), dtype=np.float32)
 
         # Bug 4 Fix: CrossEncoder.predict() expects list of [str, str] lists, not tuples
-        formatted_pairs = [[str(a), str(b)] for a, b in text_pairs]
+        formatted_pairs = [
+            [str(a).strip() or "unknown", str(b).strip() or "unknown"]
+            for a, b in text_pairs
+        ]
 
         try:
-            scores = self.model.predict(
-                formatted_pairs,
-                batch_size=self.batch_size,
-                show_progress_bar=(len(formatted_pairs) >= 5000)
-            )
+            import torch
+            if "cuda" in self.device and torch.cuda.is_available():
+                # Safe FP16 inference via autocast (hardware rule 3) - preserves FP32 LayerNorm
+                with torch.amp.autocast("cuda"):
+                    scores = self.model.predict(
+                        formatted_pairs,
+                        batch_size=self.batch_size,
+                        show_progress_bar=False
+                    )
+            else:
+                scores = self.model.predict(
+                    formatted_pairs,
+                    batch_size=self.batch_size,
+                    show_progress_bar=False
+                )
             # Normalize logits via sigmoid
             probs = 1.0 / (1.0 + np.exp(-np.clip(scores, -15.0, 15.0)))
             return np.ascontiguousarray(probs, dtype=np.float32)
         except RuntimeError as e:
-            # CUDA OOM — retry with smaller batch size
+            # Handle CUDA OOM with fallback
             if "out of memory" in str(e).lower():
                 import gc, torch
                 torch.cuda.empty_cache()
                 gc.collect()
-                fallback_bs = max(8, self.batch_size // 4)
-                print(f"  [Reranker] CUDA OOM — retrying with batch_size={fallback_bs}...")
+                fallback_bs = max(4, self.batch_size // 4)
+                print(f"  [Reranker] CUDA OOM encountered — retrying with batch_size={fallback_bs}...")
                 try:
-                    scores = self.model.predict(
-                        formatted_pairs,
-                        batch_size=fallback_bs,
-                        show_progress_bar=False
-                    )
+                    with torch.amp.autocast("cuda"):
+                        scores = self.model.predict(
+                            formatted_pairs,
+                            batch_size=fallback_bs,
+                            show_progress_bar=False
+                        )
                     probs = 1.0 / (1.0 + np.exp(-np.clip(scores, -15.0, 15.0)))
                     return np.ascontiguousarray(probs, dtype=np.float32)
                 except Exception as e2:
-                    print(f"  [Reranker ERROR] Retry also failed: {type(e2).__name__}: {e2}")
+                    import traceback
+                    print(f"  [Reranker ERROR] Fallback also failed: {type(e2).__name__}: {e2}\n{traceback.format_exc()}")
                     return np.zeros(len(text_pairs), dtype=np.float32)
             else:
-                print(f"  [Reranker ERROR] Pair prediction failed: {type(e).__name__}: {e}")
+                import traceback
+                print(f"  [Reranker ERROR] Pair prediction failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
                 return np.zeros(len(text_pairs), dtype=np.float32)
         except Exception as e:
-            print(f"  [Reranker ERROR] Pair prediction failed: {type(e).__name__}: {e}")
+            import traceback
+            print(f"  [Reranker ERROR] Pair prediction failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
             return np.zeros(len(text_pairs), dtype=np.float32)
 
 
